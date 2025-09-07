@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import pickle
 
@@ -6,11 +7,15 @@ import numpy as np
 import pandas as pd
 import torch
 import wandb
+from accelerate import Accelerator
 from scipy.stats import spearmanr, pearsonr
 from tqdm import tqdm
 
 from stabddg.model import StaBddG
 from stabddg.mpnn_utils import StructureDataset, ProteinMPNN, parse_PDB
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
 def validation_step(
@@ -77,13 +82,14 @@ def finetune(
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     ddG_loss_fn = torch.nn.MSELoss()
 
-    for e in tqdm(range(args.num_epochs), desc="Epoch"):
+    for epoch in tqdm(range(args.num_epochs), desc="Epoch"):
         model.train()
         train_sum = []
         spearmans = []
+        print_prefix = f"Epoch {epoch + 1}"
 
         # Iterate through all training domains.
-        for sample in dataset_train:
+        for sample in tqdm(dataset_train, desc="Train", unit="sample"):
             pdb_name = sample["name"]
             ddG = ddG_data[f"{pdb_name}.pdb"]["ddG"].to(device)
             mut_seqs = ddG_data[f"{pdb_name}.pdb"]["mut_seqs"]
@@ -124,45 +130,56 @@ def finetune(
             )
             spearmans.append(sp)
 
+        train_metrics = {
+            "train_loss": np.mean(train_sum),
+            "train_spearman": np.mean(spearmans),
+        }
+        logger.info(f'{print_prefix} train metrics:' + f'{train_metrics}')
+
         model.eval()
-        if (e + 1) % args.model_save_freq == 0:
+        if (epoch + 1) % args.model_save_freq == 0:
             if not os.path.exists(args.model_save_dir):
                 os.makedirs(args.model_save_dir)
             torch.save(
                 model.pmpnn.state_dict(),
-                f"{args.model_save_dir}/{args.run_name}_epoch{e}.pt",
+                f"{args.model_save_dir}/{args.run_name}_epoch{epoch}.pt",
             )
-        if args.wandb:
-            if e % args.val_freq == 0:
-                with torch.no_grad():
-                    valid_metrics = validation_step(
-                        model,
-                        ddG_data,
-                        dataset_valid,
-                        batch_size=10000,
-                        name="valid",
-                        device=device,
-                    )
-                    test_metrics = validation_step(
-                        model,
-                        ddG_data,
-                        dataset_test,
-                        batch_size=10000,
-                        name="test",
-                        device=device,
-                    )
+        if epoch % args.val_freq == 0:
+            with torch.no_grad():
+                valid_metrics = validation_step(
+                    model,
+                    ddG_data,
+                    dataset_valid,
+                    batch_size=10000,
+                    name="valid",
+                    device=device,
+                )
+                logger.info(f'{print_prefix} valid metrics:' + f'{valid_metrics}')
 
-                wandb.log(valid_metrics, step=e + 1)
-                wandb.log(test_metrics, step=e + 1)
+                test_metrics = validation_step(
+                    model,
+                    ddG_data,
+                    dataset_test,
+                    batch_size=10000,
+                    name="test",
+                    device=device,
+                )
 
-            wandb.log(
-                {
-                    "train_loss": np.mean(train_sum),
-                    "train_spearman": np.mean(spearmans),
-                },
-                step=e + 1,
-            )
-            wandb.log({"lr": optimizer.param_groups[0]["lr"]}, step=e + 1)
+                logger.info(f'{print_prefix} test metrics:' + f'{test_metrics}')
+
+            if args.wandb:
+                wandb.log(valid_metrics, step=epoch + 1)
+                wandb.log(test_metrics, step=epoch + 1)
+
+                wandb.log(
+                    {
+                        "train_loss": np.mean(train_sum),
+                        "train_spearman": np.mean(spearmans),
+                    },
+                    step=epoch + 1,
+                )
+                wandb.log({"lr": optimizer.param_groups[0]["lr"]}, step=epoch + 1)
+
     if not os.path.exists(args.model_save_dir):
         os.makedirs(args.model_save_dir)
     torch.save(
@@ -224,21 +241,21 @@ if __name__ == "__main__":
 
     # Load AF predicted structures
     pdb_dict_train = []
-    for name in tqdm(train_names, desc="Loading train set"):
+    for name in tqdm(train_names, desc="Preparing train set"):
         name = name.split(".pdb", 1)[0] + ".pdb"
         name = name.replace("|", ":")
         path = os.path.join(args.pdb_dir, name)
         pdb_dict_train.append(parse_PDB(path)[0])
 
     pdb_dict_val = []
-    for name in tqdm(val_names, desc="Loading validation set"):
+    for name in tqdm(val_names, desc="Preparing validation set"):
         name = name.split(".pdb", 1)[0] + ".pdb"
         name = name.replace("|", ":")
         path = os.path.join(args.pdb_dir, name)
         pdb_dict_val.append(parse_PDB(path)[0])
 
     pdb_dict_test = []
-    for name in tqdm(test_names, desc="Loading test set"):
+    for name in tqdm(test_names, desc="Preparing test set"):
         name = name.split(".pdb", 1)[0] + ".pdb"
         name = name.replace("|", ":")
         path = os.path.join(args.pdb_dir, name)
@@ -282,22 +299,23 @@ if __name__ == "__main__":
         ddG_data[name]["ddG"] = torch.tensor(df_mut["ddG"])
 
     # Mask all input chains
-    for dict in pdb_dict_train:
-        dict["masked_list"] = ["A"]
-        dict["visible_list"] = []
-    for dict in pdb_dict_val:
-        dict["masked_list"] = ["A"]
-        dict["visible_list"] = []
-    for dict in pdb_dict_test:
-        dict["masked_list"] = ["A"]
-        dict["visible_list"] = []
+    for cur_dict in pdb_dict_train:
+        cur_dict["masked_list"] = ["A"]
+        cur_dict["visible_list"] = []
+    for cur_dict in pdb_dict_val:
+        cur_dict["masked_list"] = ["A"]
+        cur_dict["visible_list"] = []
+    for cur_dict in pdb_dict_test:
+        cur_dict["masked_list"] = ["A"]
+        cur_dict["visible_list"] = []
 
     dataset_train = StructureDataset(pdb_dict_train, truncate=None, max_length=3000)
     dataset_valid = StructureDataset(pdb_dict_val, truncate=None, max_length=3000)
     dataset_test = StructureDataset(pdb_dict_test, truncate=None, max_length=3000)
 
     # Load pre-trained ProteinMPNN
-    device = torch.device("cuda")
+    device = Accelerator().device
+    logger.info(f"Using device: {device}", )
 
     pmpnn = ProteinMPNN(
         node_features=128,
@@ -315,7 +333,7 @@ if __name__ == "__main__":
         pmpnn.load_state_dict(mpnn_checkpoint["model_state_dict"])
     else:
         pmpnn.load_state_dict(mpnn_checkpoint)
-    print("Successfully loaded model at", args.checkpoint)
+    logger.info(f"Successfully loaded model at {args.checkpoint}")
 
     model = StaBddG(
         pmpnn=pmpnn,
@@ -328,13 +346,13 @@ if __name__ == "__main__":
 
     # Initialize wandb logging
     if args.wandb:
-        print("Initializing weights and biases.")
+        logger.info("Initializing weights and biases.")
         wandb.init(
             project="",
             entity="",
             name=args.run_name,
         )
-        print("Weights and biases initialized.")
+        logger.info("Weights and biases initialized.")
 
     finetune(
         model,

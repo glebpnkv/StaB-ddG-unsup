@@ -1,15 +1,19 @@
 import torch
 from torch import nn
 
-from .mpnn_utils import featurize
+from .mpnn_utils import featurize, ProteinMPNN
 
 
 class StaBddG(nn.Module):
     def __init__(
-        self, pmpnn, use_antithetic_variates=True, noise_level=0.1, device="cuda"
+        self,
+        pmpnn: ProteinMPNN,
+        use_antithetic_variates=True,
+        noise_level=0.1,
+        device="cuda"
     ):
         super(StaBddG, self).__init__()
-        self.pmpnn = pmpnn
+        self.pmpnn: ProteinMPNN = pmpnn
         self.use_antithetic_variates = use_antithetic_variates
         self.noise_level = noise_level
         self.device = device
@@ -69,11 +73,14 @@ class StaBddG(nn.Module):
         )
 
         wt_dG = self.folding_dG(
-            domain, wt_seq, decoding_order=decoding_order, backbone_noise=backbone_noise
+            domain=domain,
+            seqs=wt_seq,
+            decoding_order=decoding_order,
+            backbone_noise=backbone_noise
         )
         mut_dG = self.folding_dG(
-            domain,
-            mut_seqs,
+            domain=domain,
+            seqs=mut_seqs,
             decoding_order=decoding_order,
             backbone_noise=backbone_noise,
         )
