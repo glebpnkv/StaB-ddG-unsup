@@ -7,6 +7,7 @@ num_epochs=70
 batch_size=10000
 model_save_freq=2
 val_freq=2
+num_dataloader_workers=4
 
 # Data paths
 data_dir="data"
@@ -106,6 +107,7 @@ BASE_ARGS=(
   --val_freq "$val_freq"
   --pdb_dir "$pdb_dir"
   --stability_data "$stability_data"
+  --num_dataloader_workers "$num_dataloader_workers"
 )
 
 if $should_use_torchrun; then

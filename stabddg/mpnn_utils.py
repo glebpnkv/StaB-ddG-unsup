@@ -33,6 +33,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils
 import torch.utils.checkpoint
+from torch.utils.data import Dataset
 
 
 def parse_PDB_biounits(x, atoms=["N", "CA", "C"], chain=None):
@@ -147,11 +148,11 @@ def parse_PDB_biounits(x, atoms=["N", "CA", "C"], chain=None):
         return "no_chain", "no_chain"
 
 
-class StructureDataset:
+class StructureDataset(Dataset):
     def __init__(
         self,
-        pdb_dict_list,
-        verbose=True,
+        pdb_dict_list: list[dict],
+        ddG_data: dict,
         truncate=None,
         max_length=100,
         alphabet="ACDEFGHIKLMNPQRSTVWYX",
@@ -160,6 +161,7 @@ class StructureDataset:
         discard_count = {"bad_chars": 0, "too_long": 0, "bad_seq_length": 0}
 
         self.data = []
+        self.ddG_data = ddG_data
 
         for i, entry in enumerate(pdb_dict_list):
             seq = entry["seq"]
@@ -182,7 +184,25 @@ class StructureDataset:
         return len(self.data)
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        sample = self.data[idx]
+
+        # Adding ddG and mutation sequences
+        pdb_name = sample["name"]
+        ddG = self.ddG_data[f"{pdb_name}.pdb"]["ddG"]
+        mut_seqs = self.ddG_data[f"{pdb_name}.pdb"]["mut_seqs"]
+
+        sample = {**sample, "ddG": ddG, "mut_seqs": mut_seqs}
+
+        return sample
+
+
+def structured_collate_fn(batch):
+    out = {
+        k: torch.stack([s[k] for s in batch], dim=0)
+        for k in batch[0].keys()
+    }
+
+    return out
 
 
 def parse_PDB(path_to_pdb, input_chain_list=None, ca_only=False):

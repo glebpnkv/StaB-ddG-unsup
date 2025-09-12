@@ -6,27 +6,19 @@ import pickle
 import numpy as np
 import pandas as pd
 import torch
-import wandb
-# from accelerate import Accelerator
 import torch.distributed as dist
+import wandb
 from scipy.stats import spearmanr, pearsonr
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
 from stabddg.model import StaBddG
 from stabddg.mpnn_utils import StructureDataset, ProteinMPNN, parse_PDB
+from training import _is_dist_initialized, _is_main_process, _unwrap_model
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-def _is_dist_initialized() -> bool:
-    return dist.is_available() and dist.is_initialized()
-
-def _is_main_process() -> bool:
-    return (not _is_dist_initialized()) or dist.get_rank() == 0
-
-def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    # Unwrap DDP model to access underlying module (for saving state dicts, etc.)
-    return model.module if hasattr(model, "module") else model
 
 def validation_step(
     model,
@@ -79,14 +71,14 @@ def validation_step(
 
 
 def finetune(
-    model,
-    dataset_train,
-    dataset_valid,
-    dataset_test,
-    ddG_data,
+    model: ProteinMPNN,
+    dataset_train: StructureDataset,
+    dataset_valid: StructureDataset,
+    dataset_test: StructureDataset,
     args,
     batch_size=10000,
     device="cuda",
+    num_dataloader_workers: int = 4,
 ):
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     ddG_loss_fn = torch.nn.MSELoss()
@@ -108,46 +100,186 @@ def finetune(
         logger.addHandler(file_handler)
         logger.info(f"Logging to {log_path}")
 
+    # DDP state
     world_size = dist.get_world_size() if _is_dist_initialized() else 1
-    rank = dist.get_rank() if _is_dist_initialized() else 0
+
+    # Preparing data loaders (batch_size fixed to 1, use a collate_fn that returns the single element)
+    train_sampler = DistributedSampler(dataset_train, shuffle=True) if _is_dist_initialized() else None
+    valid_sampler = DistributedSampler(dataset_valid, shuffle=False) if _is_dist_initialized() else None
+    test_sampler = DistributedSampler(dataset_test, shuffle=False) if _is_dist_initialized() else None
+
+    dl_train = DataLoader(
+        dataset_train,
+        batch_size=1,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=num_dataloader_workers,
+        collate_fn=lambda x: x[0],
+        pin_memory=True,
+    )
+    dl_valid = DataLoader(
+        dataset_valid,
+        batch_size=1,
+        shuffle=False,
+        sampler=valid_sampler,
+        num_workers=num_dataloader_workers,
+        collate_fn=lambda x: x[0],
+        pin_memory=True,
+    )
+    dl_test = DataLoader(
+        dataset_test,
+        batch_size=1,
+        shuffle=False,
+        sampler=test_sampler,
+        num_workers=num_dataloader_workers,
+        collate_fn=lambda x: x[0],
+        pin_memory=True,
+    )
+
+    def _distributed_concat_1d(t: torch.Tensor) -> torch.Tensor:
+        """Concatenate variable-length 1D tensors from all ranks."""
+        if not _is_dist_initialized():
+            return t
+        local_len = torch.tensor([t.numel()], device=t.device, dtype=torch.long)
+        lens = [torch.zeros_like(local_len) for _ in range(world_size)]
+        dist.all_gather(lens, local_len)
+        max_len = int(torch.max(torch.stack(lens)).item())
+        # pad to max_len
+        pad_len = max_len - t.numel()
+        if pad_len > 0:
+            t_padded = torch.cat([t, torch.empty(pad_len, device=t.device, dtype=t.dtype)])
+        else:
+            t_padded = t
+        gathered = [torch.empty_like(t_padded) for _ in range(world_size)]
+        dist.all_gather(gathered, t_padded)
+        # trim per rank by its true length and concat
+        outs = []
+        for g, l in zip(gathered, lens):
+            outs.append(g[: int(l.item())])
+        return torch.cat(outs, dim=0)
+
+    def run_eval(dloader: DataLoader) -> dict[str, float | None]:
+        """Validation/test epoch across all ranks with DistributedSampler splitting."""
+        _unwrap_model(model).eval()
+        rank_spearmans = []
+        rank_pearsons = []
+        rank_all_pred = []
+        rank_all_labels = []
+
+        with torch.no_grad():
+            for sample in dloader:
+                # sample is a single dict (collate_fn returns x[0])
+                ddG = sample["ddG"].to(device)
+                mut_seqs = sample["mut_seqs"]
+
+                N = mut_seqs.shape[0]
+                M = batch_size // mut_seqs.shape[1]  # convert tokens to sequences per batch
+
+                sample_pred_chunks = []
+                for batch_idx in range(0, N, M):
+                    B = min(N - batch_idx, M)
+                    pred = _unwrap_model(model).folding_ddG(sample, mut_seqs[batch_idx: batch_idx + B])
+                    sample_pred_chunks.append(pred.detach().cpu())
+                pred = torch.cat(sample_pred_chunks)  # [N]
+                ddG_cpu = ddG.detach().cpu()
+
+                sp, _ = spearmanr(pred.numpy(), ddG_cpu.numpy())
+                pr, _ = pearsonr(pred.numpy(), ddG_cpu.numpy())
+                rank_spearmans.append(sp)
+                rank_pearsons.append(pr)
+
+                rank_all_pred.append(pred)
+                rank_all_labels.append(ddG_cpu)
+
+        # aggregate per-sample means
+        mean_sp = float(np.mean(rank_spearmans)) if len(rank_spearmans) else 0.0
+        mean_pr = float(np.mean(rank_pearsons)) if len(rank_pearsons) else 0.0
+
+        if _is_dist_initialized():
+            # sum of means weighted by count (counts may differ slightly if sampler sizes differ)
+            cnt_tensor = torch.tensor([len(rank_spearmans)], device=device, dtype=torch.float32)
+            sp_tensor = torch.tensor([mean_sp * (cnt_tensor.item() if cnt_tensor.item() > 0 else 1.0)], device=device)
+            pr_tensor = torch.tensor([mean_pr * (cnt_tensor.item() if cnt_tensor.item() > 0 else 1.0)], device=device)
+            dist.all_reduce(cnt_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(sp_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(pr_tensor, op=dist.ReduceOp.SUM)
+            mean_sp = (sp_tensor / torch.clamp(cnt_tensor, min=1.0)).item()
+            mean_pr = (pr_tensor / torch.clamp(cnt_tensor, min=1.0)).item()
+
+        # aggregate "all_*" metrics by concatenating predictions/labels across ranks
+        if len(rank_all_pred) > 0:
+            local_pred = torch.cat(rank_all_pred).to(device)
+            local_labels = torch.cat(rank_all_labels).to(device)
+        else:
+            local_pred = torch.empty(0, device=device)
+            local_labels = torch.empty(0, device=device)
+
+        all_pred = _distributed_concat_1d(local_pred)
+        all_labels = _distributed_concat_1d(local_labels)
+
+        # Compute global metrics only on rank 0 to avoid redundant work
+        all_sp = None
+        all_pr = None
+        if (not _is_dist_initialized()) or dist.get_rank() == 0:
+            if all_pred.numel() > 0:
+                asp, _ = spearmanr(all_pred.cpu().numpy(), all_labels.cpu().numpy())
+                apr, _ = pearsonr(all_pred.cpu().numpy(), all_labels.cpu().numpy())
+                all_sp = float(asp)
+                all_pr = float(apr)
+
+        # Broadcast global numbers to all ranks for consistency
+        if _is_dist_initialized():
+            if dist.get_rank() == 0:
+                buf = torch.tensor([all_sp if all_sp is not None else 0.0,
+                                    all_pr if all_pr is not None else 0.0], device=device)
+            else:
+                buf = torch.zeros(2, device=device)
+            dist.broadcast(buf, src=0)
+            all_sp = float(buf[0].item())
+            all_pr = float(buf[1].item())
+
+        return {
+            "spearman": mean_sp,
+            "pearson": mean_pr,
+            "all_spearman": all_sp,
+            "all_pearson": all_pr,
+        }
 
     for epoch in tqdm(range(args.num_epochs), desc="Epoch") if _is_main_process() else range(args.num_epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        if valid_sampler is not None:
+            valid_sampler.set_epoch(epoch)
+        if test_sampler is not None:
+            test_sampler.set_epoch(epoch)
+
         _unwrap_model(model).train()
         train_sum = []
         spearmans = []
         print_prefix = f"Epoch {epoch + 1}"
 
-        # Iterate through all training domains, sharded by rank.
-        # We manually shard samples because StructureDataset is iterable without a DataLoader/Sampler here.
-        for idx, sample in enumerate(dataset_train):
-            if world_size > 1 and (idx % world_size) != rank:
-                continue  # skip samples not assigned to this rank
+        # Iterate through training batches (each batch is a single sample)
+        for sample in dl_train:
+            ddG = sample["ddG"].to(device)
+            mut_seqs = sample["mut_seqs"]
 
-            pdb_name = sample["name"]
-            ddG = ddG_data[f"{pdb_name}.pdb"]["ddG"].to(device)
-            mut_seqs = ddG_data[f"{pdb_name}.pdb"]["mut_seqs"]
             N = mut_seqs.shape[0]
-            M = (
-                batch_size // mut_seqs.shape[1]
-            )  # convert number of tokens to number of sequences per batch
+            M = batch_size // mut_seqs.shape[1]  # Convert the number of tokens to sequences per batch
 
             # Random shuffling
-            # permutation = torch.randperm(ddG.shape[0], device=ddG.device)
             permutation = torch.randperm(ddG.shape[0])
             ddG = ddG[permutation]
             mut_seqs = mut_seqs[permutation]
 
             sample_pred = []
-
-            # Batching for mutants
             for batch_idx in range(0, N, M):
                 B = min(N - batch_idx, M)
                 optimizer.zero_grad(set_to_none=True)
 
                 # ddG prediction
-                pred = model.folding_ddG(sample, mut_seqs[batch_idx : batch_idx + B])
+                pred = _unwrap_model(model).folding_ddG(sample, mut_seqs[batch_idx: batch_idx + B])
 
-                ddG_loss = ddG_loss_fn(pred, ddG[batch_idx : batch_idx + B])
+                ddG_loss = ddG_loss_fn(pred, ddG[batch_idx: batch_idx + B])
 
                 ddG_loss.backward()
                 optimizer.step()
@@ -164,13 +296,14 @@ def finetune(
             )
             spearmans.append(sp)
 
-        # Optionally, aggregate training metrics across processes
-        # We aggregate mean loss and mean spearman using all-reduce.
+        # Aggregate training metrics across processes
         if _is_dist_initialized():
-            # Convert to tensors
-            loss_tensor = torch.tensor([np.mean(train_sum) if len(train_sum) > 0 else 0.0], device=device, dtype=torch.float32)
-            sp_tensor = torch.tensor([np.mean(spearmans) if len(spearmans) > 0 else 0.0], device=device, dtype=torch.float32)
-            cnt_tensor = torch.tensor([1.0 if len(train_sum) > 0 else 0.0], device=device, dtype=torch.float32)
+            loss_tensor = torch.tensor([np.mean(train_sum) if len(train_sum) > 0 else 0.0],
+                                       device=device, dtype=torch.float32)
+            sp_tensor = torch.tensor([np.mean(spearmans) if len(spearmans) > 0 else 0.0],
+                                     device=device, dtype=torch.float32)
+            cnt_tensor = torch.tensor([1.0 if len(train_sum) > 0 else 0.0],
+                                      device=device, dtype=torch.float32)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
             dist.all_reduce(sp_tensor, op=dist.ReduceOp.SUM)
             dist.all_reduce(cnt_tensor, op=dist.ReduceOp.SUM)
@@ -197,50 +330,50 @@ def finetune(
             df_metrics = pd.concat([df_metrics, df_train_metrics], ignore_index=True)
 
         _unwrap_model(model).eval()
-        # Save checkpoints only on main process
+        # Save checkpoints only on the main process
         if _is_main_process() and (epoch + 1) % args.model_save_freq == 0:
             logger.info(f"Saving model checkpoint at epoch {epoch + 1}")
             torch.save(
                 _unwrap_model(model).pmpnn.state_dict(),
                 f"{args.model_save_dir}/{args.run_name}_epoch{epoch}.pt",
             )
-        # Validation only on main process to avoid duplication
-        if _is_main_process() and (epoch + 1) % args.val_freq == 0:
+
+        # Validation and test across all ranks
+        if (epoch + 1) % args.val_freq == 0:
             with torch.no_grad():
-                valid_metrics = validation_step(_unwrap_model(model), ddG_data, dataset_valid, batch_size=10000, device=device)
+                valid_metrics = run_eval(dl_valid)
+                test_metrics = run_eval(dl_test)
+
+            if _is_main_process():
                 logger.info(f'{print_prefix}: Valid metrics: '
                             f'{ {k: "{0:0.4f}".format(v) for k, v in valid_metrics.items() if v is not None} }')
+                logger.info(f'{print_prefix}: Test metrics: '
+                            f'{ {k: "{0:0.4f}".format(v) for k, v in test_metrics.items() if v is not None} }')
+
                 df_valid_metrics = pd.DataFrame(
                     {"epoch": epoch + 1, "split": "valid"} | valid_metrics,
                     index=[0]
                 )
-                df_metrics = pd.concat([df_metrics, df_valid_metrics], ignore_index=True)
-
-                test_metrics = validation_step(_unwrap_model(model), ddG_data, dataset_test, batch_size=10000, device=device)
-                logger.info(f'{print_prefix}: Test metrics: '
-                            f'{ {k: "{0:0.4f}".format(v) for k, v in test_metrics.items() if v is not None} }')
                 df_test_metrics = pd.DataFrame(
                     {"epoch": epoch + 1, "split": "test"} | test_metrics,
                     index=[0]
                 )
-                df_metrics = pd.concat([df_metrics, df_test_metrics], ignore_index=True)
+                df_metrics = pd.concat([df_metrics, df_valid_metrics, df_test_metrics], ignore_index=True)
 
-            # Saving training metrics as a CSV file
-            if _is_main_process():
+                # Save metrics CSV
                 df_metrics.to_csv(os.path.join(args.model_save_dir, "metrics.csv"), index=False)
 
                 if args.wandb:
                     wandb.log(valid_metrics, step=epoch + 1)
                     wandb.log(test_metrics, step=epoch + 1)
-
                     wandb.log(
                         {
                             "train_loss": mean_loss_all,
                             "train_spearman": mean_sp_all,
+                            "lr": optimizer.param_groups[0]["lr"],
                         },
                         step=epoch + 1,
                     )
-                    wandb.log({"lr": optimizer.param_groups[0]["lr"]}, step=epoch + 1)
 
     if _is_main_process():
         if not os.path.exists(args.model_save_dir):
@@ -289,6 +422,7 @@ if __name__ == "__main__":
     )
     argparser.add_argument("--lr", type=float, default=1e-6)
     argparser.add_argument("--random_init", action="store_true")
+    argparser.add_argument("--num_dataloader_workers", type=int, default=4)
 
     # DDP / multi-GPU arguments
     argparser.add_argument("--distributed", action="store_true",
@@ -491,6 +625,7 @@ if __name__ == "__main__":
             args,
             batch_size=args.batch_size,
             device=device,
+            num_dataloader_workers=args.num_dataloader_workers,
         )
     finally:
         # Ensure proper cleanup
