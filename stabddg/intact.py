@@ -1,14 +1,18 @@
+import gc
 import logging
+import multiprocessing as mp
 import os
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 import gemmi
 import numpy as np
 import pandas as pd
 import requests
+import torch
 from requests.adapters import HTTPAdapter
+from safetensors.torch import save_file
 from tqdm import tqdm
 from urllib3.util.retry import Retry
 
@@ -588,3 +592,116 @@ class IntactDataController:
 
         if self.output_dir is not None:
             self.df.to_parquet(os.path.join(self.output_dir, "df_intact_mutations.parquet"), index=False)
+
+def _worker_write_safetensors(cur_uniprot, df_structures, structures_dir):
+    # Keep PyTorch single-threaded in workers to avoid CPU oversubscription
+    torch.set_num_threads(1)
+
+    df_sample = df_structures.loc[df_structures["uniprot_code"] == cur_uniprot]
+
+    # Creating a dict of arrays per sidechain atom
+    cur_tensor = df_sample.sort_values(
+        by=["resnum_auth", "atom_name"]
+    ).groupby("atom_name")[["x", "y", "z"]].apply(lambda x: x.values).to_dict()
+
+    cur_tensor = {
+        k: torch.from_numpy(v).float().contiguous()
+        for k, v in cur_tensor.items()
+    }
+
+    out_path = os.path.join(structures_dir, f"{cur_uniprot}.safetensors")
+    save_file(cur_tensor, out_path)
+    return cur_uniprot, out_path
+
+def _worker_write_safetensors_batch(batch_items: list[tuple[str, pd.DataFrame]], structures_dir: str) -> list[tuple[str, str]]:
+    """
+    Process a batch of (uniprot_code, df_group) pairs in one worker.
+    Returns list of (code, out_path).
+    """
+    # Avoid CPU oversubscription inside each process
+    torch.set_num_threads(1)
+    out: list[tuple[str, str]] = []
+    for cur_uniprot, df_group in batch_items:
+        # Same logic as the single-item worker, but on the per-code slice
+        cur_tensor = (
+            df_group.sort_values(by=["resnum_auth", "atom_name"])
+                    .groupby("atom_name")[["x", "y", "z"]]
+                    .apply(lambda x: x.values)
+                    .to_dict()
+        )
+        cur_tensor = {k: torch.from_numpy(v).float().contiguous() for k, v in cur_tensor.items()}
+        out_path = os.path.join(structures_dir, f"{cur_uniprot}.safetensors")
+        save_file(cur_tensor, out_path)
+        out.append((cur_uniprot, out_path))
+    return out
+
+def _chunked(seq, n):
+    """Yield successive chunks of size n from seq."""
+    for i in range(0, len(seq), n):
+        yield seq[i:i+n]
+
+def write_all_safetensors_parallel(
+    df_structures: pd.DataFrame,
+    structures_dir: str,
+    max_workers: int | None = None,
+    batch_size: int = 64,   # number of UniProt codes per worker task
+    limit_codes: int | None = None,  # optional for debugging
+):
+    """
+    Faster parallel writer:
+      - pre-splits df by uniprot_code once
+      - sends batches of groups to each worker to amortize overhead
+      - uses 'fork' start method on Unix to reduce serialization overhead
+    """
+    os.makedirs(structures_dir, exist_ok=True)
+
+    # Pre-split once; each item is (code, df_slice)
+    groups = [(code, g.copy(deep=False)) for code, g in df_structures.groupby("uniprot_code", sort=False)]
+    if limit_codes is not None:
+        groups = groups[:limit_codes]
+
+    total = len(groups)
+    if total == 0:
+        return [], []
+
+    # Decide workers
+    max_workers = max_workers or os.cpu_count() or 1
+
+    # Reasonable default for batch size if user leaves it small/large
+    if batch_size <= 0:
+        batch_size = max(16, (total // (max_workers * 8)) or 1)
+
+    # Chunk the work
+    batches = list(_chunked(groups, batch_size))
+
+    results: list[tuple[str, str]] = []
+    errors: list[tuple[str, Exception]] = []
+
+    # Use fork context on Unix to reduce pickling overhead
+    try:
+        ctx = mp.get_context("fork")
+    except ValueError:
+        # Non-Unix fallback
+        ctx = mp.get_context()
+
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
+        futs = {ex.submit(_worker_write_safetensors_batch, batch, structures_dir): len(batch) for batch in batches}
+        # Progress in number of codes completed, not number of batches
+        pbar = tqdm(total=total, desc="Writing safetensors (batched)", smoothing=0.1)
+        for fut in as_completed(futs):
+            batch_len = futs[fut]
+            try:
+                out_list = fut.result()
+                results.extend(out_list)
+            except Exception as e:
+                # We don't know which codes failed inside the batch; log the batch size
+                errors.append((f"batch_size={batch_len}", e))
+            finally:
+                pbar.update(batch_len)
+        pbar.close()
+
+    # Cleaning up
+    del groups, batches
+    gc.collect()
+
+    return results, errors
