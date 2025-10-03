@@ -6,3 +6,8 @@ wandb/
 .*
 *cache*
 .ipynb_checkpoints
+*.parquet
+*.pdb
+*.safetensors
+*.mapping
+*.zip

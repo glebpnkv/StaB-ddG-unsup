@@ -15,3 +15,5 @@ AA3_TO_1: dict[str, str] = {
 # ALPHABET is the collection of 1-letter amino acid codes used elsewhere in the codebase.
 # It is derived from the values of AA3_TO_1. The ordering matches the insertion order of AA3_TO_1.
 ALPHABET: list[str] = list(AA3_TO_1.values())
+
+COORDS_ORDER: list[str] = ["N", "CA", "C", "O"]

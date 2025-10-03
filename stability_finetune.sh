@@ -4,7 +4,7 @@ set -euo pipefail
 # -------- Configuration (edit here) --------
 # Training args
 num_epochs=70
-batch_size=10000
+batch_size=15000
 model_save_freq=2
 val_freq=2
 num_dataloader_workers=4

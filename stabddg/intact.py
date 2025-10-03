@@ -12,6 +12,9 @@ import pandas as pd
 import requests
 import torch
 from requests.adapters import HTTPAdapter
+from rcsbapi.data import DataQuery as DataQ
+from rcsbapi.search import AttributeQuery, NestedAttributeQuery
+from rcsbapi.model import ModelQuery
 from safetensors.torch import save_file
 from tqdm import tqdm
 from urllib3.util.retry import Retry
@@ -21,6 +24,12 @@ from stabddg.uniprot import fetch_uniprot_sequences
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Silence chatty HTTP clients used under the hood by rcsbapi (httpx/urllib3)
+# without affecting our own logger.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 # Per-thread requests session
@@ -143,6 +152,11 @@ def _structure_to_atom_dataframe(
         occupancy (float), b_factor (float),
         x (float), y (float), z (float), is_het (bool)
     """
+    # Make sure label_seq is present (safe no-op if already set)
+    st.setup_entities()
+    # Fill Residue.label_seq when SEQRES is known
+    st.assign_label_seq_id()
+
     rows = []
     for model_idx, model in enumerate(st):  # gemmi.Model
         for chain in model:  # gemmi.Chain
@@ -268,36 +282,6 @@ def fetch_alphafold_xyz(uniprot_or_pro: str) -> dict:
     out["status"] = "unresolved"
     return out
 
-    # acc_or_iso = m.group("acc")
-    # pro_id = m.group("pro")
-    #
-    # # 1) Resolve proteoform to a residue interval on the UniProt sequence
-    # start, end = _resolve_uniprot_pro_range(acc_or_iso, pro_id)
-    #
-    # # 2) Find the best PDB entry for the given UniProt range
-    # best = choose_best_pdb_for_uniprot_range(acc_or_iso, start, end)
-    #
-    # # 2) Fetch full AlphaFold model for the base accession/isoform
-    # xyz, ann = _fetch_alphafold_xyz(acc_or_iso)
-    #
-    # # 3) Slice to the proteoform range using UniProt-like residue indices in ann
-    # mask = [(start <= unp_idx <= end) for (_chain, unp_idx, _aa3, _aa1) in ann]
-    #
-    # xyz_sub = xyz[mask]
-    # ann_sub = [a for a, keep in zip(ann, mask) if keep]
-    #
-    # if xyz_sub.size == 0:
-    #     raise ValueError(f"{uniprot_or_pro}: resolved range {start}-{end} yielded 0 CA atoms. "
-    #                      f"Check isoform vs canonical numbering or missing CA records.")
-    #
-    # out = {
-    #     "ca": xyz_sub,
-    #     "ann": ann_sub,
-    #     "source": "alphafold",
-    # }
-    #
-    # return out
-
 
 # ---------------------------------------------------------------------------
 # Atom dataframe helper (PDB or CIF) for AlphaFold entries
@@ -378,45 +362,231 @@ def fetch_alphafold_atoms_parallel(
     return results
 
 
-def fetch_alphafold_xyz_parallel(
-    uniprot_codes: list[str],
+# ---------------------------------------------------------------------------
+# Assemblies helpers
+# ---------------------------------------------------------------------------
+
+def _search_assemblies_for_uniprots(uniprots: list[str]):
+    groups = []
+    for up in uniprots:
+        q_acc = AttributeQuery(
+            "rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_accession",
+            operator="exact_match",
+            value=up
+        )
+        q_db  = AttributeQuery(
+            "rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_name",
+            operator="exact_match",
+            value="UniProt"
+        )
+        groups.append(NestedAttributeQuery(q_acc, q_db))  # Creates the required nested group
+
+    out = None
+
+    if len(groups) < 2:
+        return out
+    try:
+        # AND the two UniProt groups; request assemblies
+        out = (groups[0] & groups[1])("assembly")
+    except Exception as e:
+        logger.error(f"Error searching for assemblies for UniProt accessions: {e}")
+
+    return out
+
+
+def _entries_meta_and_refs(pdb_ids):
+    """
+    Fetch, in one shot, for each entry:
+      - experimental method
+      - resolution (X-ray) or EM reconstruction resolutions
+      - set of UniProt accessions present in polymer entities
+    Returns: dict[pdb_id] -> {"method": str|None, "best_resolution": float|None, "uniprots": set[str]}
+    """
+    q = DataQ(
+        input_type="entries",
+        input_ids=list(pdb_ids),
+        return_data_list=[
+            "entries.rcsb_id",
+            "exptl.method",
+            "rcsb_entry_info.resolution_combined",
+            "em_3d_reconstruction.resolution",
+            "polymer_entities.rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_name",
+            "polymer_entities.rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_accession",
+        ],
+    )
+    data = q.exec()  # dict with data.entries [...]
+    out = {}
+    for e in data["data"]["entries"]:
+        pdb_id = e["rcsb_id"]
+        # method
+        method = None
+        if e.get("exptl"):
+            method = (e["exptl"][0] or {}).get("method")
+
+        # resolution
+        res = None
+        rc = (e.get("rcsb_entry_info") or {}).get("resolution_combined")
+        if rc:
+            res = min([v for v in rc if isinstance(v, (int, float))], default=None)
+        if res is None:
+            em = e.get("em_3d_reconstruction") or []
+            em_res = [d.get("resolution") for d in em if d.get("resolution") is not None]
+            if em_res:
+                res = min(em_res)
+
+        # UniProt set present in entry polymer entities
+        ups = set()
+        for pe in (e.get("polymer_entities") or []):
+            cont = (pe.get("rcsb_polymer_entity_container_identifiers") or {})
+            for ref in (cont.get("reference_sequence_identifiers") or []):
+                if ref.get("database_name") == "UniProt" and ref.get("database_accession"):
+                    ups.add(ref["database_accession"])
+        out[pdb_id] = {"method": method, "best_resolution": res, "uniprots": ups}
+    return out
+
+
+def _pdbe_mutations(pdb_id):
+    """
+    PDBe Graph API mutated/modified residues. Empty dict means none reported.
+    """
+    muts = {}
+    for ep in ("mutated_residues", "modified_residues"):
+        u = f"https://www.ebi.ac.uk/pdbe/graph-api/pdb/{ep}/{pdb_id}"
+        try:
+            r = requests.get(u, timeout=30)
+            if r.ok:
+                muts.update(
+                    (r.json() or {}).get(pdb_id, {})
+                )
+        except Exception:
+            pass
+    return muts
+
+
+def rank_assemblies(assembly_ids, uniprots):
+    """
+    Score & sort assemblies:
+      + require both UniProts present (heavy penalty if not)
+      + prefer no engineered mutations (PDBe), then better resolution,
+      + prefer X-ray over EM (small bonus).
+    Returns sorted list of dicts.
+    """
+    uniprots = set(uniprots)
+
+    # batch metadata
+    pdb_ids = {aid.split("-")[0] for aid in assembly_ids}
+    meta = _entries_meta_and_refs(pdb_ids)  # via rcsbapi.data
+    ranked = []
+    for aid in assembly_ids:
+        pdb_id, asm = aid.split("-")
+        m = meta.get(pdb_id, {})
+        method = (m.get("method") or "").upper()
+        res = m.get("best_resolution")
+        has_both = m.get("uniprots", set()).issuperset(uniprots)
+
+        muts = _pdbe_mutations(pdb_id)  # PDBe Graph API
+        mut_penalty = 1 if muts else 0
+        method_bonus = 0 if "X-RAY" in method else (0.25 if "ELECTRON" in method else 0.5)
+        res_use = res if isinstance(res, (int, float)) else 9.99
+
+        score = (0 if has_both else 10) + mut_penalty + method_bonus + (res_use / 10.0)
+        ranked.append({
+            "assembly_id": aid,
+            "score": score,
+            "method": m.get("method"),
+            "resolution": res,
+            "has_both": has_both,
+            "mutations": muts
+        })
+    return sorted(ranked, key=lambda x: x["score"])
+
+
+def fetch_assemblies_for_uniprots(uniprots: list[str]) -> list[dict[str, str | float | bool]] | None:
+    # Getting assemblies for UniProt accessions
+    assembly_ids = _search_assemblies_for_uniprots(uniprots)
+    if assembly_ids.count is None:
+        return None
+    if assembly_ids.count < 1:
+        return None
+
+    ranked = rank_assemblies(assembly_ids, uniprots)
+    return ranked
+
+
+def fetch_assemblies_for_uniprots_parallel(
+    uniprots_pairs: list[list[str]],
     max_workers: int = 8,
     show_progress: bool = True,
-) -> dict[str, dict]:
+) -> pd.DataFrame:
     """
-    Fetch AlphaFold CA coords+annotations for many UniProt IDs concurrently.
-
-    Returns a dict: {uniprot_code: result_dict}, where result_dict contains:
-      - status: "success" or an error message
-      - on success: keys from _fetch_alphafold_xyz (ca, ann, source)
+    Run fetch_assemblies_for_uniprots in parallel over a list of UniProt pairs.
+    Returns a DataFrame with:
+      - pair_idx: absolute enumerate index of the input pair
+      - uniprot_1, uniprot_2: the pair values as columns
+      - plus all fields returned by rank_assemblies for each assembly (or NaNs if None)
     """
-    results: dict[str, dict] = {}
-
-    def _task(code: str) -> tuple[str, dict]:
-        ses = _get_thread_session()
+    def _task(idx: int, pair: list[str]) -> tuple[int, list[str], list[dict] | None]:
         try:
-            # Reuse the same logic (supports PRO_ unresolved => returns status)
-            m = re.match(r"^(?P<acc>[A-Z0-9]+(?:-\d+)?)-(?P<pro>PRO_\d+)$", code)
-            if not m:
-                out = _fetch_alphafold_xyz(code, session=ses)
-                out["status"] = "success"
-                return code, out
-            else:
-                # mirror single-call behavior
-                return code, {"status": "unresolved"}
+            out = fetch_assemblies_for_uniprots(pair)
         except Exception as e:
-            return code, {"status": str(e)}
+            logger.error(f"Error fetching assemblies for UniProt accessions {pair}: {e}")
+            out = None
+        # Ensure pair length 2 for consistent columns
+        a = pair[0] if len(pair) > 0 else None
+        b = pair[1] if len(pair) > 1 else None
+        return idx, [a, b], out
 
+    rows: list[dict] = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(_task, code): code for code in uniprot_codes}
+        futs = {ex.submit(_task, i, pair): i for i, pair in enumerate(uniprots_pairs)}
         iterator = as_completed(futs)
         if show_progress:
-            iterator = tqdm(iterator, total=len(futs), desc="AlphaFold fetch")
+            iterator = tqdm(iterator, total=len(futs), desc="Assemblies fetch")
         for fut in iterator:
-            code, out = fut.result()
-            results[code] = out
+            idx, (u1, u2), ranked = fut.result()
+            if ranked is None or len(ranked) == 0:
+                # One row with NaNs for assembly fields
+                rows.append({
+                    "pair_idx": idx,
+                    "participant_protein": u1,
+                    "affected_protein_ac": u2,
+                    "assembly_id": None,
+                    "score": None,
+                    "method": None,
+                    "resolution": None,
+                    "has_both": None,
+                    "mutations": None,
+                })
+            else:
+                for r in ranked:
+                    rows.append({
+                        "pair_idx": idx,
+                        "participant_protein": u1,
+                        "affected_protein_ac": u2,
+                        **r,
+                    })
 
-    return results
+    # Preparing output DataFrame
+    df_out = pd.DataFrame(rows)
+    df_out = df_out.sort_values(by=["pair_idx", "score"], ignore_index=True)
+
+    return df_out
+
+
+def download_assembly_cif(assembly_id):
+    """
+    Use Model Server via rcsbapi to download the biological assembly mmCIF.
+    assembly_id is e.g. '4HHB-1' -> (entry='4HHB', name='1')
+    """
+    pdb_id, asm = assembly_id.split("-")
+    mq = ModelQuery()
+    # Model Server assembly endpoint; encoding 'cif' yields mmCIF
+    out = mq.get_assembly(
+        entry_id=pdb_id,
+        name=asm,
+        encoding="cif",
+    )
+    return out
 
 
 class IntactDataController:
