@@ -98,7 +98,7 @@ def val_epoch(
 
 
 def finetune(
-    model,
+    model: StaBddG,
     train_dataset,
     val_dataset,
     args,
@@ -264,7 +264,7 @@ if __name__ == "__main__":
         "--skempi_path", type=str, default="data/SKEMPI/filtered_skempi.csv"
     )
     argparser.add_argument(
-        "--skempi_pdb_dir", type=str, default="/home/exx/arthur/data/SKEMPI_v2/PDBs"
+        "--skempi_pdb_dir", type=str, default="data/PDBs"
     )
     argparser.add_argument(
         "--skempi_pdb_cache_path",

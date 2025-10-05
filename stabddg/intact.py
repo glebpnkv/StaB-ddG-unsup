@@ -1,20 +1,23 @@
 import gc
 import logging
 import multiprocessing as mp
+import operator as op
 import os
 import re
 import threading
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from functools import reduce
 
 import gemmi
 import numpy as np
 import pandas as pd
 import requests
 import torch
-from requests.adapters import HTTPAdapter
 from rcsbapi.data import DataQuery as DataQ
-from rcsbapi.search import AttributeQuery, NestedAttributeQuery
 from rcsbapi.model import ModelQuery
+from rcsbapi.search import AttributeQuery, NestedAttributeQuery
+from requests.adapters import HTTPAdapter
 from safetensors.torch import save_file
 from tqdm import tqdm
 from urllib3.util.retry import Retry
@@ -363,10 +366,24 @@ def fetch_alphafold_atoms_parallel(
 
 
 # ---------------------------------------------------------------------------
-# Assemblies helpers
+# 2) Assemblies helpers
 # ---------------------------------------------------------------------------
 
-def _search_assemblies_for_uniprots(uniprots: list[str]):
+def _search_assemblies_for_uniprots(
+    uniprots: list[str],
+    protein_only: bool = True
+) -> list[str]:
+    """
+    Return assembly IDs that (a) contain the supplied UniProt accession(s),
+    and (b) have ≥2 protein chains (i.e., are potentially polymers).
+    - Heteromer (len==2): require ≥2 protein chains; allow ≥2 entities.
+    - Homomer (len==1):  require ≥2 protein chains AND exactly 1 polymer entity.
+    """
+    out = []
+
+    if not uniprots:
+        return out
+
     groups = []
     for up in uniprots:
         q_acc = AttributeQuery(
@@ -381,13 +398,38 @@ def _search_assemblies_for_uniprots(uniprots: list[str]):
         )
         groups.append(NestedAttributeQuery(q_acc, q_db))  # Creates the required nested group
 
-    out = None
+    # Assembly-level filters
+    at_least_two_protein_chains = AttributeQuery(
+        "rcsb_assembly_info.polymer_entity_instance_count_protein",
+        operator="greater_or_equal", value=2
+    )  # ≥2 protein chains in the biological assembly
 
-    if len(groups) < 2:
-        return out
+    # Distinct polymer entities condition
+    if len(uniprots) == 1:   # homomer
+        entity_count_q = AttributeQuery(
+            "rcsb_assembly_info.polymer_entity_count",
+            operator="equals", value=1
+        )  # one entity repeated → true homomer
+    else:  # heteromer (2+)
+        entity_count_q = AttributeQuery(
+            "rcsb_assembly_info.polymer_entity_count",
+            operator="greater_or_equal", value=2
+        )
+
+    extra = [at_least_two_protein_chains, entity_count_q]
+    if protein_only:
+        extra.append(AttributeQuery(
+            "rcsb_entry_info.selected_polymer_entity_types",
+            operator="exact_match", value="Protein (only)"
+        ))  # optional cleanup
+
+    # Build final AND query
+    all_terms = groups + extra
+    query = reduce(op.and_, all_terms)
+
     try:
         # AND the two UniProt groups; request assemblies
-        out = (groups[0] & groups[1])("assembly")
+        out = list(query(return_type="assembly"))
     except Exception as e:
         logger.error(f"Error searching for assemblies for UniProt accessions: {e}")
 
@@ -463,6 +505,65 @@ def _pdbe_mutations(pdb_id):
     return muts
 
 
+def _assemblies_uniprot_instance_counts(assembly_ids: list[str]) -> dict[str, dict[str, int]]:
+    """
+    For each assembly (e.g. '4HHB-1'), count how many polymer_entity_instances
+    map to each UniProt accession.
+    Returns: { '4HHB-1': {'P69905':2, 'P68871':2}, ... }
+    """
+    if not assembly_ids:
+        return {}
+
+    q = DataQ(
+        input_type="assemblies",
+        input_ids=list(assembly_ids),
+        return_data_list=[
+            "assemblies.rcsb_id",  # compound id 'PDBID-assemblyId'
+            "polymer_entity_instances.polymer_entity."
+            "rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_name",
+            "polymer_entity_instances.polymer_entity."
+            "rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_accession",
+        ],
+    )
+    data = q.exec()["data"]["assemblies"]
+    out = {}
+    for asm in data:
+        asm_id = asm["rcsb_id"]
+        counts = defaultdict(int)
+        for inst in (asm.get("polymer_entity_instances") or []):
+            poly = inst.get("polymer_entity") or {}
+            cont = poly.get("rcsb_polymer_entity_container_identifiers") or {}
+            for ref in (cont.get("reference_sequence_identifiers") or []):
+                if ref.get("database_name") == "UniProt" and ref.get("database_accession"):
+                    counts[ref["database_accession"]] += 1
+                    break  # count each instance once
+        out[asm_id] = dict(counts)
+    return out
+
+
+def _filter_assemblies_by_uniprot_counts(assembly_ids: list[str], uniprots: list[str]) -> list[str]:
+    """
+    Keep assemblies only if they truly satisfy the stoichiometry:
+      - heteromer (2 IDs): each present in ≥1 instance
+      - homomer (1 ID): that ID present in ≥2 instances
+    """
+    want = list(uniprots)
+    counts = _assemblies_uniprot_instance_counts(assembly_ids)
+    keep = []
+    if len(want) == 1:
+        up = want[0]
+        for aid in assembly_ids:
+            if counts.get(aid, {}).get(up, 0) >= 2:
+                keep.append(aid)
+    else:
+        a, b = want[0], want[1]
+        for aid in assembly_ids:
+            c = counts.get(aid, {})
+            if c.get(a, 0) >= 1 and c.get(b, 0) >= 1:
+                keep.append(aid)
+    return keep
+
+
 def rank_assemblies(assembly_ids, uniprots):
     """
     Score & sort assemblies:
@@ -504,9 +605,11 @@ def rank_assemblies(assembly_ids, uniprots):
 def fetch_assemblies_for_uniprots(uniprots: list[str]) -> list[dict[str, str | float | bool]] | None:
     # Getting assemblies for UniProt accessions
     assembly_ids = _search_assemblies_for_uniprots(uniprots)
-    if assembly_ids.count is None:
-        return None
-    if assembly_ids.count < 1:
+
+    # Filter assemblies by UniProt counts
+    assembly_ids = _filter_assemblies_by_uniprot_counts(assembly_ids, uniprots)
+
+    if len(assembly_ids) < 1:
         return None
 
     ranked = rank_assemblies(assembly_ids, uniprots)
@@ -587,6 +690,66 @@ def download_assembly_cif(assembly_id):
         encoding="cif",
     )
     return out
+
+
+def fetch_assemblies_atoms(
+    asm_id: str,
+    chains: set[str] | None = None,
+    atoms: set[str] | None = None,  # e.g., {"N","CA","C","O"} or None for all atoms
+    include_het: bool = False,  # include waters/ligands if True
+    prefer_label_seq: bool = True,  # mmCIF label_seq where present
+) -> dict:
+    try:
+        cif_string = download_assembly_cif(asm_id)
+        st = _read_structure_from_text(cif_string, "cif")
+
+        df = _structure_to_atom_dataframe(
+            st,
+            chains=chains,
+            atoms=atoms,
+            include_het=include_het,
+            prefer_label_seq=prefer_label_seq,
+        )
+
+        return {
+            "status": "success",
+            "df": df
+        }
+    except Exception as e:
+        return {"status": str(e)}
+
+
+def fetch_assemblies_atoms_parallel(
+    asm_ids: list[str],
+    chains: set[str] | None = None,
+    atoms: set[str] | None = None,  # e.g., {"N","CA","C","O"} or None for all atoms
+    include_het: bool = False,  # include waters/ligands if True
+    prefer_label_seq: bool = True,  # mmCIF label_seq where present
+    max_workers: int = 8,
+    show_progress: bool = True,
+):
+    results: dict[str, dict] = {}
+
+    def _task(code: str) -> tuple[str, dict]:
+        out = fetch_assemblies_atoms(
+            code,
+            chains=chains,
+            atoms=atoms,
+            include_het=include_het,
+            prefer_label_seq=prefer_label_seq,
+        )
+        return code, out
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(_task, code): code for code in asm_ids}
+        iterator = as_completed(futs)
+        if show_progress:
+            iterator = tqdm(iterator, total=len(futs), desc="Assemblies fetch")
+        for fut in iterator:
+            code, out = fut.result()
+            results[code] = out
+
+    return results
 
 
 class IntactDataController:
