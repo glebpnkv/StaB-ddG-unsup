@@ -22,7 +22,7 @@ from safetensors.torch import save_file
 from tqdm import tqdm
 from urllib3.util.retry import Retry
 
-from stabddg.constants import AA3_TO_1
+from stabddg.constants import AA3_TO_1, COORDS_ORDER
 from stabddg.uniprot import fetch_uniprot_sequences
 
 logging.basicConfig(level=logging.INFO)
@@ -592,7 +592,7 @@ def rank_assemblies(assembly_ids, uniprots):
 
         score = (0 if has_both else 10) + mut_penalty + method_bonus + (res_use / 10.0)
         ranked.append({
-            "assembly_id": aid,
+            "biological_assembly": aid,
             "score": score,
             "method": m.get("method"),
             "resolution": res,
@@ -675,21 +675,91 @@ def fetch_assemblies_for_uniprots_parallel(
 
     return df_out
 
+def normalize_entry(s: str) -> str:
+    # Accept stuff like '8CT8', '8CT8-1', '8CT8_2', '8ct8'
+    m = re.match(r"(?i)^([0-9a-z]{4})", s.strip())
+    if not m:
+        raise ValueError(f"Unrecognized ID: {s}")
+    return m.group(1).upper()
 
-def download_assembly_cif(assembly_id):
-    """
-    Use Model Server via rcsbapi to download the biological assembly mmCIF.
-    assembly_id is e.g. '4HHB-1' -> (entry='4HHB', name='1')
-    """
-    pdb_id, asm = assembly_id.split("-")
-    mq = ModelQuery()
-    # Model Server assembly endpoint; encoding 'cif' yields mmCIF
-    out = mq.get_assembly(
-        entry_id=pdb_id,
-        name=asm,
-        encoding="cif",
+
+def list_assembly_ids(entry_id: str) -> list[str]:
+    entry = normalize_entry(entry_id)
+    q = AttributeQuery(
+        "rcsb_entry_container_identifiers.entry_id",
+        operator="exact_match",
+        value=entry,
     )
+    # Returns ["8CT8-1", "8CT8-2", ...]
+    asm_ids = list(q.exec(return_type="assembly"))
+    return [aid.split("-")[1] for aid in asm_ids]  # -> ["1","2",...]
+
+
+def download_all_assemblies(entry_id: str) -> dict[str, str]:
+    """
+    Download every biological assembly for the entry.
+    Returns a dict keyed by '8CT8-1', '8CT8-2', ... with CIF text values.
+    """
+    entry = normalize_entry(entry_id)
+    asm_nums = list_assembly_ids(entry)
+    mq = ModelQuery()
+
+    out = {}
+    for a in asm_nums:
+        # Model Server assembly endpoint; encoding 'cif' yields mmCIF
+        out[f"{entry}-{a}"] = mq.get_assembly(
+            entry_id=entry,        # NOTE: entry only
+            name=a,                # <-- assembly id goes here
+            encoding="cif",
+            copy_all_categories=True,
+        )
+
     return out
+
+
+def _write_assemblies_safetensors(
+    assemblies_dict: dict[str, pd.DataFrame],
+    structures_dir: str
+) -> list[tuple[str, str]]:
+    """
+    Write a safetensors file per entry assembly set.
+
+    - Input assemblies_dict keys look like 'ASM-1', 'ASM-2', ...
+    - Output tensor keys will be '1', '2', ... (suffix after the last dash)
+    - Each tensor value is a stacked (n_atoms, 3) float32 array of coordinates
+      grouped by atom_name after filtering to COORDS_ORDER and sorting by
+      ['resnum_auth', 'atom_name'] similarly to _worker_write_safetensors_batch.
+    - The resulting file name is '{asm_id}.safetensors' saved into structures_dir.
+    """
+    # Keep PyTorch single-threaded to avoid CPU oversubscription
+    torch.set_num_threads(1)
+    os.makedirs(structures_dir, exist_ok=True)
+
+    results: list[tuple[str, str]] = []
+    for key, df in assemblies_dict.items():
+        df_filt = df.loc[df["atom_name"].isin(COORDS_ORDER)]
+
+        # Build per-atom tensors in the same structure as _worker_write_safetensors_batch
+        if df_filt.empty:
+            cur_tensor = {a: torch.empty((0, 3), dtype=torch.float32) for a in COORDS_ORDER}
+        else:
+            grouped = (
+                df_filt.sort_values(by=["resnum_auth", "atom_name"])
+                      .groupby("atom_name")[["x", "y", "z"]]
+                      .apply(lambda x: x.values)
+                      .to_dict()
+            )
+            cur_tensor = {
+                a: torch.from_numpy(grouped[a]).float().contiguous() if a in grouped
+                   else torch.empty((0, 3), dtype=torch.float32)
+                for a in COORDS_ORDER
+            }
+
+        out_path = os.path.join(structures_dir, f"{key}.safetensors")
+        save_file(cur_tensor, out_path)
+        results.append((key, out_path))
+
+    return results
 
 
 def fetch_assemblies_atoms(
@@ -698,23 +768,38 @@ def fetch_assemblies_atoms(
     atoms: set[str] | None = None,  # e.g., {"N","CA","C","O"} or None for all atoms
     include_het: bool = False,  # include waters/ligands if True
     prefer_label_seq: bool = True,  # mmCIF label_seq where present
+    structures_dir: str | None = None,
 ) -> dict:
     try:
-        cif_string = download_assembly_cif(asm_id)
-        st = _read_structure_from_text(cif_string, "cif")
+        cif_string_dict = download_all_assemblies(asm_id)
 
-        df = _structure_to_atom_dataframe(
-            st,
-            chains=chains,
-            atoms=atoms,
-            include_het=include_het,
-            prefer_label_seq=prefer_label_seq,
-        )
-
-        return {
-            "status": "success",
-            "df": df
+        st_dict = {
+            k: _read_structure_from_text(v, "cif")
+            for k, v in cif_string_dict.items()
         }
+
+        df_assemblies_dict = {
+            k: _structure_to_atom_dataframe(
+                st,
+                chains=chains,
+                atoms=atoms,
+                include_het=include_het,
+                prefer_label_seq=prefer_label_seq,
+            )
+            for k, st in st_dict.items()
+        }
+
+        out = {
+            "status": "success",
+            "assemblies_dict": df_assemblies_dict
+        }
+
+        if structures_dir is not None:
+            # Write a single safetensors file with keys as assembly suffixes
+            written = _write_assemblies_safetensors(df_assemblies_dict, structures_dir)
+            out["safetensors_paths"] = dict(written)
+
+        return out
     except Exception as e:
         return {"status": str(e)}
 
