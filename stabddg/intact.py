@@ -1060,11 +1060,11 @@ def _worker_write_safetensors_batch(
     torch.set_num_threads(1)
     out: list[tuple[str, str]] = []
     for cur_uniprot, df_group in batch_items:
-        df_filt_res = df_group.groupby(["resnum_label", "res_name_1"], as_index=False).size()
+        df_filt_res = df_group.groupby(["chain", "resnum_label", "res_name_1"], as_index=False).size()
         df_filt_res = df_filt_res.drop(columns=["size"])
         # Creating a dict of arrays per sidechain atom
         cur_tensor = (
-            df_group.sort_values(by=["resnum_label", "atom_name"])
+            df_group.sort_values(by=["chain", "resnum_label", "atom_name"])
             .groupby("atom_name")[["x", "y", "z"]]
             .apply(lambda x: x.values)
             .to_dict()
