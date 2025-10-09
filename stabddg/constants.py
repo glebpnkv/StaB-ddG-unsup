@@ -17,3 +17,5 @@ AA3_TO_1: dict[str, str] = {
 ALPHABET: list[str] = list(AA3_TO_1.values())
 
 COORDS_ORDER: list[str] = ["N", "CA", "C", "O"]
+
+SEQUENCE_UNKNOWN = AA3_TO_1["UNK"]

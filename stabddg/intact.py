@@ -22,7 +22,7 @@ from safetensors.torch import save_file
 from tqdm import tqdm
 from urllib3.util.retry import Retry
 
-from stabddg.constants import AA3_TO_1, COORDS_ORDER
+from stabddg.constants import AA3_TO_1, ALPHABET, COORDS_ORDER, SEQUENCE_UNKNOWN
 from stabddg.uniprot import fetch_uniprot_sequences
 
 logging.basicConfig(level=logging.INFO)
@@ -181,7 +181,7 @@ def _structure_to_atom_dataframe(
                 label_seq = getattr(res, "label_seq", 0) or 0
                 resnum_label = int(label_seq) if (prefer_label_seq and label_seq != 0) else None
 
-                for at in res:  # gemmi.Atom
+                for at in res.first_conformer():  # gemmi.Atom - picks a single altloc per atom group
                     atom_name = at.name.strip()
                     if atoms is not None and atom_name not in atoms:
                         continue
@@ -196,7 +196,7 @@ def _structure_to_atom_dataframe(
                         "ins_code": ins_code,
                         "atom_name": atom_name,
                         "element": at.element.name,
-                        "altloc": at.altloc if hasattr(at, "altloc") else "",
+                        "altloc": (at.altloc if at.has_altloc() else ""),
                         "occupancy": float(at.occ),
                         "b_factor": float(at.b_iso),
                         "x": float(at.pos.x),
@@ -695,32 +695,27 @@ def list_assembly_ids(entry_id: str) -> list[str]:
     return [aid.split("-")[1] for aid in asm_ids]  # -> ["1","2",...]
 
 
-def download_all_assemblies(entry_id: str) -> dict[str, str]:
+def download_assembly_cif(assembly_key: str) -> str:
     """
-    Download every biological assembly for the entry.
-    Returns a dict keyed by '8CT8-1', '8CT8-2', ... with CIF text values.
+    Use Model Server via rcsbapi to download the biological assembly mmCIF.
+    assembly_id is e.g. '4HHB-1' -> (entry='4HHB', name='1')
     """
-    entry = normalize_entry(entry_id)
-    asm_nums = list_assembly_ids(entry)
+    pdb_id, asm = assembly_key.split("-")
     mq = ModelQuery()
-
-    out = {}
-    for a in asm_nums:
-        # Model Server assembly endpoint; encoding 'cif' yields mmCIF
-        out[f"{entry}-{a}"] = mq.get_assembly(
-            entry_id=entry,        # NOTE: entry only
-            name=a,                # <-- assembly id goes here
-            encoding="cif",
-            copy_all_categories=True,
-        )
-
+    # Model Server assembly endpoint; encoding 'cif' yields mmCIF
+    out = mq.get_assembly(
+        entry_id=pdb_id,
+        name=asm,
+        encoding="cif",
+    )
     return out
 
 
 def _write_assemblies_safetensors(
-    assemblies_dict: dict[str, pd.DataFrame],
-    structures_dir: str
-) -> list[tuple[str, str]]:
+    df_assemblies: pd.DataFrame,
+    structures_dir: str,
+    file_name: str,
+) -> str:
     """
     Write a safetensors file per entry assembly set.
 
@@ -735,35 +730,56 @@ def _write_assemblies_safetensors(
     torch.set_num_threads(1)
     os.makedirs(structures_dir, exist_ok=True)
 
-    results: list[tuple[str, str]] = []
-    for key, df in assemblies_dict.items():
-        df_filt = df.loc[df["atom_name"].isin(COORDS_ORDER)]
+    df_filt = df_assemblies.loc[df_assemblies["atom_name"].isin(COORDS_ORDER)]
 
-        # Build per-atom tensors in the same structure as _worker_write_safetensors_batch
-        if df_filt.empty:
-            cur_tensor = {a: torch.empty((0, 3), dtype=torch.float32) for a in COORDS_ORDER}
-        else:
-            grouped = (
-                df_filt.sort_values(by=["resnum_auth", "atom_name"])
-                      .groupby("atom_name")[["x", "y", "z"]]
-                      .apply(lambda x: x.values)
-                      .to_dict()
-            )
-            cur_tensor = {
-                a: torch.from_numpy(grouped[a]).float().contiguous() if a in grouped
-                   else torch.empty((0, 3), dtype=torch.float32)
-                for a in COORDS_ORDER
-            }
+    # Build per-atom tensors in the same structure as _worker_write_safetensors_batch
+    if df_filt.empty:
+        cur_tensor = {
+            "X": torch.empty((0, 3), dtype=torch.float32),
+            "S": torch.empty((0, 3), dtype=torch.int64),
+        }
+    else:
+        df_filt_res = df_filt.groupby(["chain", "resnum_label", "res_name_1"], as_index=False).size()
+        df_filt_res = df_filt_res.drop(columns=["size"])
+        # Atom coordinates grouped by atom_name after filtering to COORDS_ORDER
+        x_grouped = (
+            df_filt.sort_values(by=["chain", "resnum_label", "atom_name"])
+            .groupby("atom_name")[["x", "y", "z"]]
+            .apply(lambda x: x.values)
+            .to_dict()
+        )
+        x_grouped = np.stack([x_grouped[a] for a in COORDS_ORDER if a in x_grouped], axis=-2)
 
-        out_path = os.path.join(structures_dir, f"{key}.safetensors")
-        save_file(cur_tensor, out_path)
-        results.append((key, out_path))
+        # Amino acid sequences expressed as integers
+        resnames = df_filt_res["res_name_1"]
+        seq_list = [ch if ch in ALPHABET else SEQUENCE_UNKNOWN for ch in resnames]
+        seq_list =  np.asarray([ALPHABET.index(ch) for ch in seq_list], dtype=np.int32)
 
-    return results
+        # IDs of chains
+        chain_encoding_all = (df_filt_res["chain"] != df_filt_res["chain"].shift().bfill()).cumsum()
+        chain_encoding_all = chain_encoding_all.values
+
+        # Mask - ones everywhere means predictions are required for every amino acid
+        mask = torch.ones(len(chain_encoding_all))
+
+        residue_idx = torch.arange(len(chain_encoding_all)) + 100 * torch.from_numpy(chain_encoding_all)
+
+        cur_tensor = {
+            "X": torch.from_numpy(x_grouped).float().contiguous(),
+            "S": torch.from_numpy(seq_list).int().contiguous(),
+            "chain_encoding_all": torch.from_numpy(chain_encoding_all + 1).int().contiguous(),
+            "mask": mask,
+            "residue_idx": residue_idx.int().contiguous(),
+        }
+
+    out_path = os.path.join(structures_dir, f"{file_name}.safetensors")
+    save_file(cur_tensor, out_path)
+
+    return out_path
 
 
 def fetch_assemblies_atoms(
-    asm_id: str,
+    assembly_key: str,
     chains: set[str] | None = None,
     atoms: set[str] | None = None,  # e.g., {"N","CA","C","O"} or None for all atoms
     include_het: bool = False,  # include waters/ligands if True
@@ -771,33 +787,30 @@ def fetch_assemblies_atoms(
     structures_dir: str | None = None,
 ) -> dict:
     try:
-        cif_string_dict = download_all_assemblies(asm_id)
+        cif_string = download_assembly_cif(assembly_key)
+        st = _read_structure_from_text(cif_string, fmt="cif")
 
-        st_dict = {
-            k: _read_structure_from_text(v, "cif")
-            for k, v in cif_string_dict.items()
-        }
-
-        df_assemblies_dict = {
-            k: _structure_to_atom_dataframe(
-                st,
-                chains=chains,
-                atoms=atoms,
-                include_het=include_het,
-                prefer_label_seq=prefer_label_seq,
-            )
-            for k, st in st_dict.items()
-        }
+        df_assemblies = _structure_to_atom_dataframe(
+            st,
+            chains=chains,
+            atoms=atoms,
+            include_het=include_het,
+            prefer_label_seq=prefer_label_seq,
+        )
 
         out = {
             "status": "success",
-            "assemblies_dict": df_assemblies_dict
+            "df_assemblies": df_assemblies
         }
 
         if structures_dir is not None:
             # Write a single safetensors file with keys as assembly suffixes
-            written = _write_assemblies_safetensors(df_assemblies_dict, structures_dir)
-            out["safetensors_paths"] = dict(written)
+            written = _write_assemblies_safetensors(
+                df_assemblies,
+                structures_dir,
+                assembly_key
+            )
+            out["safetensors_path"] = written
 
         return out
     except Exception as e:
@@ -812,6 +825,7 @@ def fetch_assemblies_atoms_parallel(
     prefer_label_seq: bool = True,  # mmCIF label_seq where present
     max_workers: int = 8,
     show_progress: bool = True,
+    structures_dir: str | None = None,
 ):
     results: dict[str, dict] = {}
 
@@ -822,6 +836,7 @@ def fetch_assemblies_atoms_parallel(
             atoms=atoms,
             include_het=include_het,
             prefer_label_seq=prefer_label_seq,
+            structures_dir=structures_dir
         )
         return code, out
 
@@ -1011,6 +1026,7 @@ class IntactDataController:
         if self.output_dir is not None:
             self.df.to_parquet(os.path.join(self.output_dir, "df_intact_mutations.parquet"), index=False)
 
+
 def _worker_write_safetensors(cur_uniprot, df_structures, structures_dir):
     # Keep PyTorch single-threaded in workers to avoid CPU oversubscription
     torch.set_num_threads(1)
@@ -1031,7 +1047,11 @@ def _worker_write_safetensors(cur_uniprot, df_structures, structures_dir):
     save_file(cur_tensor, out_path)
     return cur_uniprot, out_path
 
-def _worker_write_safetensors_batch(batch_items: list[tuple[str, pd.DataFrame]], structures_dir: str) -> list[tuple[str, str]]:
+
+def _worker_write_safetensors_batch(
+    batch_items: list[tuple[str, pd.DataFrame]],
+    structures_dir: str
+) -> list[tuple[str, str]]:
     """
     Process a batch of (uniprot_code, df_group) pairs in one worker.
     Returns list of (code, out_path).
@@ -1040,17 +1060,43 @@ def _worker_write_safetensors_batch(batch_items: list[tuple[str, pd.DataFrame]],
     torch.set_num_threads(1)
     out: list[tuple[str, str]] = []
     for cur_uniprot, df_group in batch_items:
-        # Same logic as the single-item worker, but on the per-code slice
+        df_filt_res = df_group.groupby(["resnum_label", "res_name_1"], as_index=False).size()
+        df_filt_res = df_filt_res.drop(columns=["size"])
+        # Creating a dict of arrays per sidechain atom
         cur_tensor = (
-            df_group.sort_values(by=["resnum_auth", "atom_name"])
-                    .groupby("atom_name")[["x", "y", "z"]]
-                    .apply(lambda x: x.values)
-                    .to_dict()
+            df_group.sort_values(by=["resnum_label", "atom_name"])
+            .groupby("atom_name")[["x", "y", "z"]]
+            .apply(lambda x: x.values)
+            .to_dict()
         )
-        cur_tensor = {k: torch.from_numpy(v).float().contiguous() for k, v in cur_tensor.items()}
+        x_grouped = np.stack([cur_tensor[a] for a in COORDS_ORDER if a in cur_tensor], axis=-2)
+
+        # Amino acid sequences expressed as integers
+        resnames = df_filt_res["res_name_1"]
+        seq_list = [ch if ch in ALPHABET else SEQUENCE_UNKNOWN for ch in resnames]
+        seq_list = np.asarray([ALPHABET.index(ch) for ch in seq_list], dtype=np.int32)
+
+        # IDs of chains
+        chain_encoding_all = (df_filt_res["chain"] != df_filt_res["chain"].shift().bfill()).cumsum()
+        chain_encoding_all = chain_encoding_all.values
+
+        # Mask - ones everywhere means predictions are required for every amino acid
+        mask = torch.ones(len(chain_encoding_all))
+
+        residue_idx = torch.arange(len(chain_encoding_all)) + 100 * torch.from_numpy(chain_encoding_all)
+
+        cur_tensor = {
+            "X": torch.from_numpy(x_grouped).float().contiguous(),
+            "S": torch.from_numpy(seq_list).int().contiguous(),
+            "chain_encoding_all": torch.from_numpy(chain_encoding_all + 1).int().contiguous(),
+            "mask": mask,
+            "residue_idx": residue_idx.int().contiguous(),
+        }
+
         out_path = os.path.join(structures_dir, f"{cur_uniprot}.safetensors")
         save_file(cur_tensor, out_path)
         out.append((cur_uniprot, out_path))
+
     return out
 
 def _chunked(seq, n):
