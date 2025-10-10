@@ -1,12 +1,10 @@
-import gc
 import logging
-import multiprocessing as mp
 import operator as op
 import os
 import re
 import threading
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import reduce
 
 import gemmi
@@ -84,48 +82,6 @@ def _read_structure_from_text(text: str, fmt: str) -> gemmi.Structure:
         return gemmi.read_pdb_string(text)
     else:
         raise ValueError(f"Unsupported format: {fmt}")
-
-
-def _extract_ca_xyz_and_annotations(st: gemmi.Structure) -> dict:
-    """Walk all models/chains/residues and collect CA coordinates.
-
-    Returns
-    -------
-    xyz : np.ndarray
-        Array of shape (N, 3) with float64 coordinates for CA atoms.
-    ann : list[tuple[str, int, str, str]]
-        Parallel annotations per CA: (chain_id, uniprot_like_index, aa3, aa1).
-        The residue index is taken from `label_seq` when available (UniProt-like
-        numbering in mmCIF); otherwise fall back to the author seqid.
-    """
-    ca: list[list[float]] = []
-    ann: list[dict[str, int | str]] = []
-
-    for model in st:  # gemmi.Model
-        for chain in model:  # gemmi.Chain
-            for res in chain:  # gemmi.Residue
-                at = res.get_ca()  # returns None for non-standard/hetero residues
-                if at is None:
-                    continue
-                # Coordinates (x, y, z) in Ångström
-                ca.append([at.pos.x, at.pos.y, at.pos.z])
-
-                # Prefer label_seq (UniProt-like) if present; otherwise use seqid.num
-                unp_idx = res.label_seq if getattr(res, "label_seq", 0) != 0 else res.seqid.num
-
-                aa3 = res.name.upper()
-                aa1 = AA3_TO_1.get(aa3, "X")
-                # ann.append((chain.name, int(unp_idx), aa3, aa1))
-                ann.append({
-                    "chain_name": chain.name,
-                    "uniprot_like_index": int(unp_idx),
-                    "aa3": aa3,
-                    "aa1": aa1,
-                })
-
-    out = {"ca": np.asarray(ca, dtype=float)} | {"ann": ann}
-
-    return out
 
 
 def _structure_to_atom_dataframe(
@@ -254,43 +210,11 @@ def _fetch_alphafold_structure(
     return st, url, fmt
 
 
-def _fetch_alphafold_xyz(uniprot_acc: str, session: requests.Session | None = None) -> dict:
-    """Return (N,3) CA coords and annotations: (chain, uniprot_idx, aa3, aa1)."""
-    # Keep existing mmCIF preference for XYZ
-    st, url, fmt = _fetch_alphafold_structure(uniprot_acc, session=session, prefer_format="cif")
-    out = _extract_ca_xyz_and_annotations(st)
-    out["source"] = "alphafold"
-    return out
-
-
-def fetch_alphafold_xyz(uniprot_or_pro: str) -> dict:
-    """
-    Accepts either a plain UniProt accession/isoform (e.g. 'O92972' or 'O92972-1')
-    or a proteoform-like code 'O92972-PRO_0000278753'. Returns (N,3) CA coords + annotations.
-    """
-    out = {}
-
-    m = re.match(r"^(?P<acc>[A-Z0-9]+(?:-\d+)?)-(?P<pro>PRO_\d+)$", uniprot_or_pro)
-    if not m:
-        # No PRO_ suffix: just use AlphaFold DB directly
-        try:
-            out = _fetch_alphafold_xyz(uniprot_or_pro)
-            out["status"] = "success"
-        except Exception as e:
-            status = str(e)
-            out["status"] = status
-
-        return out
-
-    out["status"] = "unresolved"
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Atom dataframe helper (PDB or CIF) for AlphaFold entries
 # ---------------------------------------------------------------------------
 
-def fetch_alphafold_atoms(
+def fetch_alphafold_atoms_df(
     uniprot_or_pro: str,
     *,
     prefer_format: str = "pdb",           # "pdb" if you want strict compatibility with PDB-centric tooling
@@ -320,11 +244,19 @@ def fetch_alphafold_atoms(
             include_het=include_het,
             prefer_label_seq=prefer_label_seq,
         )
+
+        entry_id = uniprot_or_pro
+        chain_map = {"A": uniprot_or_pro}
+        metadata = chain_map | {
+            "entry_id": entry_id,
+        }
+
         return {
             "status": "success",
             "df": df,
             "source_url": url,
             "format": fmt,
+            "metadata": metadata
         }
     except Exception as e:
         return {"status": str(e)}
@@ -339,19 +271,41 @@ def fetch_alphafold_atoms_parallel(
     prefer_label_seq: bool = True,  # mmCIF label_seq where present
     max_workers: int = 8,
     show_progress: bool = True,
+    parquet_dir: str | None = None,
+    safetensors_dir: str | None = None,
 ):
+    if parquet_dir is not None:
+        os.makedirs(parquet_dir, exist_ok=True)
     results: dict[str, dict] = {}
 
     def _task(code: str) -> tuple[str, dict]:
-        out = fetch_alphafold_atoms(
-            code,
-            prefer_format=prefer_format,
-            chains=chains,
-            atoms=atoms,
-            include_het=include_het,
-            prefer_label_seq=prefer_label_seq,
-        )
-        return code, out
+        try:
+            out = fetch_alphafold_atoms_df(
+                code,
+                prefer_format=prefer_format,
+                chains=chains,
+                atoms=atoms,
+                include_het=include_het,
+                prefer_label_seq=prefer_label_seq,
+            )
+
+            # Do nothing further if the download did not succeed
+            if out["status"] != "success":
+                return code, out
+
+            if parquet_dir is not None:
+                parquet_path = os.path.join(parquet_dir, f"{code}.parquet")
+                out["df"].to_parquet(parquet_path, index=False)
+                out["parquet_path"] = parquet_path
+            if safetensors_dir is not None:
+                st_path = _write_assemblies_safetensors(out["df"], safetensors_dir, code, metadata=out["metadata"])
+                out["safetensors_path"] = st_path
+            # include df only if not saving to reduce memory
+            if parquet_dir is not None and safetensors_dir is not None:
+                del out["df"]
+            return code, out
+        except Exception as e:
+            return code, {"status": str(e)}
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {ex.submit(_task, code): code for code in uniprot_codes}
@@ -374,65 +328,63 @@ def _search_assemblies_for_uniprots(
     protein_only: bool = True
 ) -> list[str]:
     """
-    Return assembly IDs that (a) contain the supplied UniProt accession(s),
-    and (b) have ≥2 protein chains (i.e., are potentially polymers).
-    - Heteromer (len==2): require ≥2 protein chains; allow ≥2 entities.
-    - Homomer (len==1):  require ≥2 protein chains AND exactly 1 polymer entity.
-    """
+        Search for assemblies that contain all requested UniProt accessions (ignoring multiplicities here),
+        plus assembly-level constraints. Multiplicity is enforced later.
+        """
     out = []
-
     if not uniprots:
         return out
 
+    want = Counter(uniprots)
+    uniq = list(want.keys())
+
     groups = []
-    for up in uniprots:
+    for up in uniq:
         q_acc = AttributeQuery(
             "rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_accession",
-            operator="exact_match",
-            value=up
+            operator="exact_match", value=up
         )
-        q_db  = AttributeQuery(
+        q_db = AttributeQuery(
             "rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_name",
-            operator="exact_match",
-            value="UniProt"
+            operator="exact_match", value="UniProt"
         )
-        groups.append(NestedAttributeQuery(q_acc, q_db))  # Creates the required nested group
+        groups.append(NestedAttributeQuery(q_acc, q_db))
 
     # Assembly-level filters
     at_least_two_protein_chains = AttributeQuery(
         "rcsb_assembly_info.polymer_entity_instance_count_protein",
-        operator="greater_or_equal", value=2
-    )  # ≥2 protein chains in the biological assembly
+        operator="greater_or_equal",
+        value=2
+    )
 
-    # Distinct polymer entities condition
-    if len(uniprots) == 1:   # homomer
+    if len(uniq) == 1:
+        # true homomer → exactly one polymer entity type in the assembly
         entity_count_q = AttributeQuery(
             "rcsb_assembly_info.polymer_entity_count",
-            operator="equals", value=1
-        )  # one entity repeated → true homomer
-    else:  # heteromer (2+)
+            operator="equals",
+            value=1
+        )
+    else:
+        # heteromer → at least as many distinct entities as requested uniques
         entity_count_q = AttributeQuery(
             "rcsb_assembly_info.polymer_entity_count",
-            operator="greater_or_equal", value=2
+            operator="greater_or_equal",
+            value=len(uniq)
         )
 
     extra = [at_least_two_protein_chains, entity_count_q]
     if protein_only:
         extra.append(AttributeQuery(
             "rcsb_entry_info.selected_polymer_entity_types",
-            operator="exact_match", value="Protein (only)"
-        ))  # optional cleanup
+            operator="exact_match",
+            value="Protein (only)"
+        ))
 
-    # Build final AND query
-    all_terms = groups + extra
-    query = reduce(op.and_, all_terms)
-
+    query = reduce(op.and_, groups + extra)
     try:
-        # AND the two UniProt groups; request assemblies
         out = list(query(return_type="assembly"))
     except Exception as e:
         logger.error(f"Error searching for assemblies for UniProt accessions: {e}")
-
     return out
 
 
@@ -594,24 +546,15 @@ def _assemblies_uniprot_instance_counts(assembly_ids: list[str]) -> dict[str, di
 
 def _filter_assemblies_by_uniprot_counts(assembly_ids: list[str], uniprots: list[str]) -> list[str]:
     """
-    Keep assemblies only if they truly satisfy the stoichiometry:
-      - heteromer (2 IDs): each present in ≥1 instance
-      - homomer (1 ID): that ID present in ≥2 instances
+    Enforce multiplicities exactly (e.g., ["P04626","P04626"] → require ≥2 instances of P04626).
     """
-    want = list(uniprots)
-    counts = _assemblies_uniprot_instance_counts(assembly_ids)
+    want = Counter(uniprots)  # e.g., {"P04626": 2} or {"A": 1, "B": 1}
+    counts = _assemblies_uniprot_instance_counts(assembly_ids)  # {aid: {up: n_instances}}
     keep = []
-    if len(want) == 1:
-        up = want[0]
-        for aid in assembly_ids:
-            if counts.get(aid, {}).get(up, 0) >= 2:
-                keep.append(aid)
-    else:
-        a, b = want[0], want[1]
-        for aid in assembly_ids:
-            c = counts.get(aid, {})
-            if c.get(a, 0) >= 1 and c.get(b, 0) >= 1:
-                keep.append(aid)
+    for aid in assembly_ids:
+        c = counts.get(aid, {})
+        if all(c.get(up, 0) >= need for up, need in want.items()):
+            keep.append(aid)
     return keep
 
 
@@ -734,18 +677,6 @@ def normalize_entry(s: str) -> str:
     return m.group(1).upper()
 
 
-def list_assembly_ids(entry_id: str) -> list[str]:
-    entry = normalize_entry(entry_id)
-    q = AttributeQuery(
-        "rcsb_entry_container_identifiers.entry_id",
-        operator="exact_match",
-        value=entry,
-    )
-    # Returns ["8CT8-1", "8CT8-2", ...]
-    asm_ids = list(q.exec(return_type="assembly"))
-    return [aid.split("-")[1] for aid in asm_ids]  # -> ["1","2",...]
-
-
 def download_assembly_cif(assembly_key: str) -> str:
     """
     Use Model Server via rcsbapi to download the biological assembly mmCIF.
@@ -795,24 +726,31 @@ def _write_assemblies_safetensors(
 
     df_filt = df_assemblies.loc[df_assemblies["atom_name"].isin(COORDS_ORDER)]
 
+    # always define chain_to_encoding
+    chain_to_encoding: dict[str, str] = {}
+
     # Build per-atom tensors in the same structure as _worker_write_safetensors_batch
     if df_filt.empty:
         cur_tensor = {
             "X": torch.empty((0, 3), dtype=torch.float32),
-            "S": torch.empty((0, 3), dtype=torch.int64),
+            "S": torch.empty((0,), dtype=torch.int64),
+            "resnums": torch.empty((0,), dtype=torch.int32),
+            "chain_encoding_all": torch.empty((0,), dtype=torch.int32),
+            "mask": torch.empty((0,), dtype=torch.float32),
+            "residue_idx": torch.empty((0,), dtype=torch.int32),
         }
     else:
         df_filt_res = df_filt.groupby(["chain", "resnum_label", "res_name_1"], as_index=False).size()
         df_filt_res = df_filt_res.drop(columns=["size"])
 
         # Atom coordinates grouped by atom_name after filtering to COORDS_ORDER
-        x_grouped = (
-            df_filt.sort_values(by=["chain", "resnum_label", "atom_name"])
+        x_grouped_dict = (
+            df_filt.sort_values(by=["chain", "resnum_label", "atom_name"]) 
             .groupby("atom_name")[["x", "y", "z"]]
             .apply(lambda x: x.values)
             .to_dict()
         )
-        x_grouped = np.stack([x_grouped[a] for a in COORDS_ORDER if a in x_grouped], axis=-2)
+        x_grouped = np.stack([x_grouped_dict[a] for a in COORDS_ORDER if a in x_grouped_dict], axis=-2)
 
         # Positions of residues in the chain
         resnums = df_filt_res["resnum_label"].values
@@ -830,7 +768,7 @@ def _write_assemblies_safetensors(
         # The first contiguous run of a chain is assigned 1, next chain 2, etc.
         first_occ = df_filt_res["chain"].ne(df_filt_res["chain"].shift()).to_numpy()
         chain_order = df_filt_res["chain"].to_numpy()[first_occ]
-        chain_to_encoding: dict[str, str] = {
+        chain_to_encoding = {
             f"chain_encoding:{int(i + 1)}": str(ch)
             for i, ch in enumerate(chain_order)
         }
@@ -863,55 +801,40 @@ def _write_assemblies_safetensors(
     return out_path
 
 
-def fetch_assemblies_atoms(
+def fetch_assembly_atoms_df(
     assembly_key: str,
+    *,
     chains: set[str] | None = None,
-    atoms: set[str] | None = None,  # e.g., {"N","CA","C","O"} or None for all atoms
-    include_het: bool = False,  # include waters/ligands if True
-    prefer_label_seq: bool = True,  # mmCIF label_seq where present
-    structures_dir: str | None = None,
+    atoms: set[str] | None = None,
+    include_het: bool = False,
+    prefer_label_seq: bool = True,
 ) -> dict:
+    """
+    Download assembly mmCIF, parse to atom DataFrame, and build metadata.
+    Returns (df_assemblies, metadata).
+    """
     try:
         cif_string = download_assembly_cif(assembly_key)
         st = _read_structure_from_text(cif_string, fmt="cif")
-
-        df_assemblies = _structure_to_atom_dataframe(
+        df = _structure_to_atom_dataframe(
             st,
             chains=chains,
             atoms=atoms,
             include_het=include_het,
             prefer_label_seq=prefer_label_seq,
         )
-
-        # Mapping between the chains and the UniProt protein names
         entry_id = normalize_entry(assembly_key)
         chain_map = _fetch_chain_to_uniprot_map_rcsb(entry_id)
-        chain_map = {
-            k: chain_map[k]
-            for k in df_assemblies["chain"].unique()
-        }
+        chain_map = {k: chain_map[k] for k in df["chain"].unique() if k in chain_map}
         metadata = chain_map | {
             "biological_assembly": assembly_key,
             "entry_id": entry_id,
         }
-
-        out = {
+        return {
             "status": "success",
-            "df_assemblies": df_assemblies,
-            "metadata": metadata
+            "df": df,
+            "metadata": metadata,
         }
-
-        if structures_dir is not None:
-            # Write a single safetensors file with keys as assembly suffixes
-            written = _write_assemblies_safetensors(
-                df_assemblies,
-                structures_dir,
-                assembly_key,
-                metadata=metadata,
-            )
-            out["safetensors_path"] = written
-
-        return out
     except Exception as e:
         return {"status": str(e)}
 
@@ -924,20 +847,46 @@ def fetch_assemblies_atoms_parallel(
     prefer_label_seq: bool = True,  # mmCIF label_seq where present
     max_workers: int = 8,
     show_progress: bool = True,
-    structures_dir: str | None = None,
+    parquet_dir: str | None = None,
+    safetensors_dir: str | None = None,
 ):
+    """
+    Parallel wrapper that now splits the assembly flow:
+      - fetch coordinates (DataFrame + metadata) per assembly
+      - optionally save coordinates as Parquet (one file per assembly)
+      - optionally write safetensors using the same per-structure writer as proteins
+    """
+    if parquet_dir is not None:
+        os.makedirs(parquet_dir, exist_ok=True)
     results: dict[str, dict] = {}
 
     def _task(code: str) -> tuple[str, dict]:
-        out = fetch_assemblies_atoms(
-            code,
-            chains=chains,
-            atoms=atoms,
-            include_het=include_het,
-            prefer_label_seq=prefer_label_seq,
-            structures_dir=structures_dir
-        )
-        return code, out
+        try:
+            out = fetch_assembly_atoms_df(
+                code,
+                chains=chains,
+                atoms=atoms,
+                include_het=include_het,
+                prefer_label_seq=prefer_label_seq,
+            )
+
+            # Do nothing further if the download did not succeed
+            if out["status"] != "success":
+                return code, out
+
+            if parquet_dir is not None:
+                parquet_path = os.path.join(parquet_dir, f"{code}.parquet")
+                out["df"].to_parquet(parquet_path, index=False)
+                out["parquet_path"] = parquet_path
+            if safetensors_dir is not None:
+                st_path = _write_assemblies_safetensors(out["df"], safetensors_dir, code, metadata=out["metadata"])
+                out["safetensors_path"] = st_path
+            # include df only if not saving to reduce memory
+            if parquet_dir is not None and safetensors_dir is not None:
+                del out["df"]
+            return code, out
+        except Exception as e:
+            return code, {"status": str(e)}
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {ex.submit(_task, code): code for code in asm_ids}
@@ -949,6 +898,89 @@ def fetch_assemblies_atoms_parallel(
             results[code] = out
 
     return results
+
+
+def _worker_write_safetensors(cur_uniprot, df_structures, structures_dir):
+    # Keep PyTorch single-threaded in workers to avoid CPU oversubscription
+    torch.set_num_threads(1)
+
+    df_sample = df_structures.loc[df_structures["uniprot_code"] == cur_uniprot]
+
+    # Creating a dict of arrays per sidechain atom
+    cur_tensor = df_sample.sort_values(
+        by=["resnum_auth", "atom_name"]
+    ).groupby("atom_name")[["x", "y", "z"]].apply(lambda x: x.values).to_dict()
+
+    cur_tensor = {
+        k: torch.from_numpy(v).float().contiguous()
+        for k, v in cur_tensor.items()
+    }
+
+    out_path = os.path.join(structures_dir, f"{cur_uniprot}.safetensors")
+    save_file(cur_tensor, out_path)
+    return cur_uniprot, out_path
+
+
+def _worker_write_safetensors_batch(
+    batch_items: list[tuple[str, pd.DataFrame]],
+    structures_dir: str
+) -> list[tuple[str, str]]:
+    """
+    Process a batch of (uniprot_code, df_group) pairs in one worker.
+    Returns list of (code, out_path).
+    """
+    # Avoid CPU oversubscription inside each process
+    torch.set_num_threads(1)
+    out: list[tuple[str, str]] = []
+    for cur_uniprot, df_group in batch_items:
+        df_filt_res = df_group.groupby(["chain", "resnum_label", "res_name_1"], as_index=False).size()
+        df_filt_res = df_filt_res.drop(columns=["size"])
+        # Creating a dict of arrays per sidechain atom
+        cur_tensor = (
+            df_group.sort_values(by=["chain", "resnum_label", "atom_name"])
+            .groupby("atom_name")[["x", "y", "z"]]
+            .apply(lambda x: x.values)
+            .to_dict()
+        )
+        x_grouped = np.stack([cur_tensor[a] for a in COORDS_ORDER if a in cur_tensor], axis=-2)
+
+        # Positions of residues in the chain
+        resnums = df_filt_res["resnum_label"].values
+
+        # Amino acid sequences expressed as integers
+        resnames = df_filt_res["res_name_1"]
+        seq_list = [ch if ch in ALPHABET else SEQUENCE_UNKNOWN for ch in resnames]
+        seq_list = np.asarray([ALPHABET.index(ch) for ch in seq_list], dtype=np.int32)
+
+        # IDs of chains
+        chain_encoding_all = (df_filt_res["chain"] != df_filt_res["chain"].shift().bfill()).cumsum()
+        chain_encoding_all = chain_encoding_all.values
+
+        # Mask: having ones everywhere means predictions are required for every amino acid
+        mask = torch.ones(len(chain_encoding_all))
+
+        residue_idx = torch.arange(len(chain_encoding_all)) + 100 * torch.from_numpy(chain_encoding_all)
+
+        cur_tensor = {
+            "X": torch.from_numpy(x_grouped).float().contiguous(),
+            "resnums": torch.from_numpy(resnums).int().contiguous(),
+            "S": torch.from_numpy(seq_list).int().contiguous(),
+            "chain_encoding_all": torch.from_numpy(chain_encoding_all + 1).int().contiguous(),
+            "mask": mask,
+            "residue_idx": residue_idx.int().contiguous(),
+        }
+
+        metadata = {
+            "entry_id": cur_uniprot,
+            "A": cur_uniprot,
+            "chain_encoding:1": "A"
+        }
+
+        out_path = os.path.join(structures_dir, f"{cur_uniprot}.safetensors")
+        save_file(cur_tensor, out_path, metadata=metadata)
+        out.append((cur_uniprot, out_path))
+
+    return out
 
 
 class IntactDataController:
@@ -1124,157 +1156,3 @@ class IntactDataController:
 
         if self.output_dir is not None:
             self.df.to_parquet(os.path.join(self.output_dir, "df_intact_mutations.parquet"), index=False)
-
-
-def _worker_write_safetensors(cur_uniprot, df_structures, structures_dir):
-    # Keep PyTorch single-threaded in workers to avoid CPU oversubscription
-    torch.set_num_threads(1)
-
-    df_sample = df_structures.loc[df_structures["uniprot_code"] == cur_uniprot]
-
-    # Creating a dict of arrays per sidechain atom
-    cur_tensor = df_sample.sort_values(
-        by=["resnum_auth", "atom_name"]
-    ).groupby("atom_name")[["x", "y", "z"]].apply(lambda x: x.values).to_dict()
-
-    cur_tensor = {
-        k: torch.from_numpy(v).float().contiguous()
-        for k, v in cur_tensor.items()
-    }
-
-    out_path = os.path.join(structures_dir, f"{cur_uniprot}.safetensors")
-    save_file(cur_tensor, out_path)
-    return cur_uniprot, out_path
-
-
-def _worker_write_safetensors_batch(
-    batch_items: list[tuple[str, pd.DataFrame]],
-    structures_dir: str
-) -> list[tuple[str, str]]:
-    """
-    Process a batch of (uniprot_code, df_group) pairs in one worker.
-    Returns list of (code, out_path).
-    """
-    # Avoid CPU oversubscription inside each process
-    torch.set_num_threads(1)
-    out: list[tuple[str, str]] = []
-    for cur_uniprot, df_group in batch_items:
-        df_filt_res = df_group.groupby(["chain", "resnum_label", "res_name_1"], as_index=False).size()
-        df_filt_res = df_filt_res.drop(columns=["size"])
-        # Creating a dict of arrays per sidechain atom
-        cur_tensor = (
-            df_group.sort_values(by=["chain", "resnum_label", "atom_name"])
-            .groupby("atom_name")[["x", "y", "z"]]
-            .apply(lambda x: x.values)
-            .to_dict()
-        )
-        x_grouped = np.stack([cur_tensor[a] for a in COORDS_ORDER if a in cur_tensor], axis=-2)
-
-        # Positions of residues in the chain
-        resnums = df_filt_res["resnum_label"].values
-
-        # Amino acid sequences expressed as integers
-        resnames = df_filt_res["res_name_1"]
-        seq_list = [ch if ch in ALPHABET else SEQUENCE_UNKNOWN for ch in resnames]
-        seq_list = np.asarray([ALPHABET.index(ch) for ch in seq_list], dtype=np.int32)
-
-        # IDs of chains
-        chain_encoding_all = (df_filt_res["chain"] != df_filt_res["chain"].shift().bfill()).cumsum()
-        chain_encoding_all = chain_encoding_all.values
-
-        # Mask: having ones everywhere means predictions are required for every amino acid
-        mask = torch.ones(len(chain_encoding_all))
-
-        residue_idx = torch.arange(len(chain_encoding_all)) + 100 * torch.from_numpy(chain_encoding_all)
-
-        cur_tensor = {
-            "X": torch.from_numpy(x_grouped).float().contiguous(),
-            "resnums": torch.from_numpy(resnums).int().contiguous(),
-            "S": torch.from_numpy(seq_list).int().contiguous(),
-            "chain_encoding_all": torch.from_numpy(chain_encoding_all + 1).int().contiguous(),
-            "mask": mask,
-            "residue_idx": residue_idx.int().contiguous(),
-        }
-
-        metadata = {
-            "entry_id": cur_uniprot,
-            "A": cur_uniprot,
-            "chain_encoding:1": "A"
-        }
-
-        out_path = os.path.join(structures_dir, f"{cur_uniprot}.safetensors")
-        save_file(cur_tensor, out_path, metadata=metadata)
-        out.append((cur_uniprot, out_path))
-
-    return out
-
-def _chunked(seq, n):
-    """Yield successive chunks of size n from seq."""
-    for i in range(0, len(seq), n):
-        yield seq[i:i+n]
-
-def write_all_safetensors_parallel(
-    df_structures: pd.DataFrame,
-    structures_dir: str,
-    max_workers: int | None = None,
-    batch_size: int = 64,   # number of UniProt codes per worker task
-    limit_codes: int | None = None,  # optional for debugging
-):
-    """
-    Faster parallel writer:
-      - pre-splits df by uniprot_code once
-      - sends batches of groups to each worker to amortize overhead
-      - uses 'fork' start method on Unix to reduce serialization overhead
-    """
-    os.makedirs(structures_dir, exist_ok=True)
-
-    # Pre-split once; each item is (code, df_slice)
-    groups = [(code, g.copy(deep=False)) for code, g in df_structures.groupby("uniprot_code", sort=False)]
-    if limit_codes is not None:
-        groups = groups[:limit_codes]
-
-    total = len(groups)
-    if total == 0:
-        return [], []
-
-    # Decide workers
-    max_workers = max_workers or os.cpu_count() or 1
-
-    # Reasonable default for batch size if user leaves it small/large
-    if batch_size <= 0:
-        batch_size = max(16, (total // (max_workers * 8)) or 1)
-
-    # Chunk the work
-    batches = list(_chunked(groups, batch_size))
-
-    results: list[tuple[str, str]] = []
-    errors: list[tuple[str, Exception]] = []
-
-    # Use fork context on Unix to reduce pickling overhead
-    try:
-        ctx = mp.get_context("fork")
-    except ValueError:
-        # Non-Unix fallback
-        ctx = mp.get_context()
-
-    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
-        futs = {ex.submit(_worker_write_safetensors_batch, batch, structures_dir): len(batch) for batch in batches}
-        # Progress in number of codes completed, not number of batches
-        pbar = tqdm(total=total, desc="Writing safetensors (batched)", smoothing=0.1)
-        for fut in as_completed(futs):
-            batch_len = futs[fut]
-            try:
-                out_list = fut.result()
-                results.extend(out_list)
-            except Exception as e:
-                # We don't know which codes failed inside the batch; log the batch size
-                errors.append((f"batch_size={batch_len}", e))
-            finally:
-                pbar.update(batch_len)
-        pbar.close()
-
-    # Cleaning up
-    del groups, batches
-    gc.collect()
-
-    return results, errors
