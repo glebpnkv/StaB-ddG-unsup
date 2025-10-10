@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import requests
 import torch
-from rcsbapi.data import DataQuery as DataQ
+from rcsbapi.data import DataQuery
 from rcsbapi.model import ModelQuery
 from rcsbapi.search import AttributeQuery, NestedAttributeQuery
 from requests.adapters import HTTPAdapter
@@ -444,7 +444,7 @@ def _entries_meta_and_refs(pdb_ids):
       - set of UniProt accessions present in polymer entities
     Returns: dict[pdb_id] -> {"method": str|None, "best_resolution": float|None, "uniprots": set[str]}
     """
-    q = DataQ(
+    q = DataQuery(
         input_type="entries",
         input_ids=list(pdb_ids),
         return_data_list=[
@@ -487,6 +487,57 @@ def _entries_meta_and_refs(pdb_ids):
     return out
 
 
+def _fetch_chain_to_uniprot_map_rcsb(pdb_id: str) -> dict[str, str]:
+    """
+    Map author chain IDs (auth_asym_id) to UniProt accession via RCSB Data API.
+    """
+    q = DataQuery(
+        input_type="entries",
+        input_ids=[pdb_id.upper()],
+        return_data_list=[
+            # per-entity metadata
+            "polymer_entities.rcsb_polymer_entity_container_identifiers.entity_id",
+            "polymer_entities.rcsb_polymer_entity_container_identifiers.auth_asym_ids",
+            # cross-refs – filter to UniProt below
+            "polymer_entities.rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_name",
+            "polymer_entities.rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_accession",
+        ],
+    )
+    resp = q.exec()
+    mapping: dict[str, str] = {}
+
+    entries = (resp.get("data", {}) or {}).get("entries") or []
+    if not entries:
+        return mapping
+
+    for ent in entries[0].get("polymer_entities", []) or []:
+        cont = ent.get("rcsb_polymer_entity_container_identifiers") or {}
+        refs = cont.get("reference_sequence_identifiers") or []
+        # take the first UniProt xref if present
+        unp = next(
+            (r.get("database_accession")
+             for r in refs
+             if (r.get("database_name") or "").lower() in ("uniprot", "unp")),
+            ""
+        )
+        if not unp:
+            continue
+
+        chains = cont.get("auth_asym_ids")
+        if isinstance(chains, list):
+            chain_list = chains
+        elif isinstance(chains, str):
+            chain_list = [c.strip() for c in chains.replace(",", " ").split()]
+        else:
+            chain_list = []
+
+        for ch in chain_list:
+            if ch:
+                mapping.setdefault(ch, unp)
+
+    return mapping
+
+
 def _pdbe_mutations(pdb_id):
     """
     PDBe Graph API mutated/modified residues. Empty dict means none reported.
@@ -514,7 +565,7 @@ def _assemblies_uniprot_instance_counts(assembly_ids: list[str]) -> dict[str, di
     if not assembly_ids:
         return {}
 
-    q = DataQ(
+    q = DataQuery(
         input_type="assemblies",
         input_ids=list(assembly_ids),
         return_data_list=[
@@ -715,16 +766,28 @@ def _write_assemblies_safetensors(
     df_assemblies: pd.DataFrame,
     structures_dir: str,
     file_name: str,
+    metadata: dict[str, str] | None = None,
 ) -> str:
     """
-    Write a safetensors file per entry assembly set.
+    Creates a SafeTensors file for residue and atom data following a specific structure.
 
-    - Input assemblies_dict keys look like 'ASM-1', 'ASM-2', ...
-    - Output tensor keys will be '1', '2', ... (suffix after the last dash)
-    - Each tensor value is a stacked (n_atoms, 3) float32 array of coordinates
-      grouped by atom_name after filtering to COORDS_ORDER and sorting by
-      ['resnum_auth', 'atom_name'] similarly to _worker_write_safetensors_batch.
-    - The resulting file name is '{asm_id}.safetensors' saved into structures_dir.
+    This function processes a given pandas DataFrame containing atomic and residue-level
+    information, filters it, organizes data into grouped structures, and saves the
+    resulting data into a SafeTensors file. It includes additional residue and chain
+    encodings, masking information, and sequence transformations. It ensures that only
+    valid amino acids in the provided dataset are converted and uses predefined
+    global settings for atom ordering (COORDS_ORDER), sequence alphabets (ALPHABET), and
+    unknown residue handling (SEQUENCE_UNKNOWN).
+
+    Parameters:
+        df_assemblies (pd.DataFrame): DataFrame containing amino acid residue and atom-level
+                                      data to process and encode into tensors.
+        structures_dir (str): Directory path where the resulting SafeTensors file will be stored.
+        file_name (str): Name of the output file (excluding extension).
+        metadata (dict): Additional metadata to be included in the safetensors file.
+
+    Returns:
+        str: The full path to the created SafeTensors file.
     """
     # Keep PyTorch single-threaded to avoid CPU oversubscription
     torch.set_num_threads(1)
@@ -741,6 +804,7 @@ def _write_assemblies_safetensors(
     else:
         df_filt_res = df_filt.groupby(["chain", "resnum_label", "res_name_1"], as_index=False).size()
         df_filt_res = df_filt_res.drop(columns=["size"])
+
         # Atom coordinates grouped by atom_name after filtering to COORDS_ORDER
         x_grouped = (
             df_filt.sort_values(by=["chain", "resnum_label", "atom_name"])
@@ -749,6 +813,9 @@ def _write_assemblies_safetensors(
             .to_dict()
         )
         x_grouped = np.stack([x_grouped[a] for a in COORDS_ORDER if a in x_grouped], axis=-2)
+
+        # Positions of residues in the chain
+        resnums = df_filt_res["resnum_label"].values
 
         # Amino acid sequences expressed as integers
         resnames = df_filt_res["res_name_1"]
@@ -759,13 +826,23 @@ def _write_assemblies_safetensors(
         chain_encoding_all = (df_filt_res["chain"] != df_filt_res["chain"].shift().bfill()).cumsum()
         chain_encoding_all = chain_encoding_all.values
 
-        # Mask - ones everywhere means predictions are required for every amino acid
+        # Explicit chain -> encoding map (encoding matches 'chain_encoding_all' tensor values)
+        # The first contiguous run of a chain is assigned 1, next chain 2, etc.
+        first_occ = df_filt_res["chain"].ne(df_filt_res["chain"].shift()).to_numpy()
+        chain_order = df_filt_res["chain"].to_numpy()[first_occ]
+        chain_to_encoding: dict[str, str] = {
+            f"chain_encoding:{int(i + 1)}": str(ch)
+            for i, ch in enumerate(chain_order)
+        }
+
+        # Mask: having ones everywhere means predictions are required for every amino acid
         mask = torch.ones(len(chain_encoding_all))
 
         residue_idx = torch.arange(len(chain_encoding_all)) + 100 * torch.from_numpy(chain_encoding_all)
 
         cur_tensor = {
             "X": torch.from_numpy(x_grouped).float().contiguous(),
+            "resnums": torch.from_numpy(resnums).int().contiguous(),
             "S": torch.from_numpy(seq_list).int().contiguous(),
             "chain_encoding_all": torch.from_numpy(chain_encoding_all + 1).int().contiguous(),
             "mask": mask,
@@ -773,7 +850,15 @@ def _write_assemblies_safetensors(
         }
 
     out_path = os.path.join(structures_dir, f"{file_name}.safetensors")
-    save_file(cur_tensor, out_path)
+
+    # Merge chain_to_encoding into metadata so it is saved alongside other fields
+    meta_final = {}
+    if metadata:
+        meta_final.update({k: str(v) for k, v in metadata.items()})
+    # Prefix to avoid collisions with other metadata keys if desired; string values required by safetensors
+    meta_final = meta_final | chain_to_encoding
+
+    save_file(cur_tensor, out_path, metadata=meta_final)
 
     return out_path
 
@@ -798,9 +883,22 @@ def fetch_assemblies_atoms(
             prefer_label_seq=prefer_label_seq,
         )
 
+        # Mapping between the chains and the UniProt protein names
+        entry_id = normalize_entry(assembly_key)
+        chain_map = _fetch_chain_to_uniprot_map_rcsb(entry_id)
+        chain_map = {
+            k: chain_map[k]
+            for k in df_assemblies["chain"].unique()
+        }
+        metadata = chain_map | {
+            "biological_assembly": assembly_key,
+            "entry_id": entry_id,
+        }
+
         out = {
             "status": "success",
-            "df_assemblies": df_assemblies
+            "df_assemblies": df_assemblies,
+            "metadata": metadata
         }
 
         if structures_dir is not None:
@@ -808,7 +906,8 @@ def fetch_assemblies_atoms(
             written = _write_assemblies_safetensors(
                 df_assemblies,
                 structures_dir,
-                assembly_key
+                assembly_key,
+                metadata=metadata,
             )
             out["safetensors_path"] = written
 
@@ -1071,6 +1170,9 @@ def _worker_write_safetensors_batch(
         )
         x_grouped = np.stack([cur_tensor[a] for a in COORDS_ORDER if a in cur_tensor], axis=-2)
 
+        # Positions of residues in the chain
+        resnums = df_filt_res["resnum_label"].values
+
         # Amino acid sequences expressed as integers
         resnames = df_filt_res["res_name_1"]
         seq_list = [ch if ch in ALPHABET else SEQUENCE_UNKNOWN for ch in resnames]
@@ -1080,21 +1182,28 @@ def _worker_write_safetensors_batch(
         chain_encoding_all = (df_filt_res["chain"] != df_filt_res["chain"].shift().bfill()).cumsum()
         chain_encoding_all = chain_encoding_all.values
 
-        # Mask - ones everywhere means predictions are required for every amino acid
+        # Mask: having ones everywhere means predictions are required for every amino acid
         mask = torch.ones(len(chain_encoding_all))
 
         residue_idx = torch.arange(len(chain_encoding_all)) + 100 * torch.from_numpy(chain_encoding_all)
 
         cur_tensor = {
             "X": torch.from_numpy(x_grouped).float().contiguous(),
+            "resnums": torch.from_numpy(resnums).int().contiguous(),
             "S": torch.from_numpy(seq_list).int().contiguous(),
             "chain_encoding_all": torch.from_numpy(chain_encoding_all + 1).int().contiguous(),
             "mask": mask,
             "residue_idx": residue_idx.int().contiguous(),
         }
 
+        metadata = {
+            "entry_id": cur_uniprot,
+            "A": cur_uniprot,
+            "chain_encoding:1": "A"
+        }
+
         out_path = os.path.join(structures_dir, f"{cur_uniprot}.safetensors")
-        save_file(cur_tensor, out_path)
+        save_file(cur_tensor, out_path, metadata=metadata)
         out.append((cur_uniprot, out_path))
 
     return out

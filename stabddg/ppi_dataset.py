@@ -8,7 +8,7 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from .mpnn_utils import parse_PDB
-from .utils import extract_chains
+from .utils.pdb import extract_chains
 
 
 class CombinedDataset(Dataset):
