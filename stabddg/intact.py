@@ -20,7 +20,7 @@ from safetensors.torch import save_file
 from tqdm import tqdm
 from urllib3.util.retry import Retry
 
-from stabddg.constants import AA3_TO_1, ALPHABET, COORDS_ORDER, SEQUENCE_UNKNOWN
+from stabddg.constants import AA3_TO_1, ALPHABET, COORDS_ORDER, SEQUENCE_DELETION, SEQUENCE_UNKNOWN
 from stabddg.uniprot import fetch_uniprot_sequences
 
 logging.basicConfig(level=logging.INFO)
@@ -133,15 +133,13 @@ def _structure_to_atom_dataframe(
                 # Author residue number (PDB numbering)
                 auth_num = res.seqid.num if hasattr(res, "seqid") else None
                 ins_code = res.seqid.icode if hasattr(res, "seqid") else ""
-                # Label sequence index (UniProt-like in mmCIF) if present and non-zero
-                label_seq = getattr(res, "label_seq", 0) or 0
+                label_seq = int(getattr(res, "label_seq", 0) or 0)
                 resnum_label = int(label_seq) if (prefer_label_seq and label_seq != 0) else None
 
                 for at in res.first_conformer():  # gemmi.Atom - picks a single altloc per atom group
                     atom_name = at.name.strip()
                     if atoms is not None and atom_name not in atoms:
                         continue
-
                     rows.append({
                         "model": model_idx,
                         "chain": chain_id,
@@ -244,6 +242,8 @@ def fetch_alphafold_atoms_df(
             include_het=include_het,
             prefer_label_seq=prefer_label_seq,
         )
+        df["item_id"] = uniprot_or_pro  # Adding uniprot_or_pro as an ID to DataFrame
+        df["abs_pos_label"] = df["resnum_label"]
 
         entry_id = uniprot_or_pro
         chain_map = {"A": uniprot_or_pro}
@@ -328,10 +328,10 @@ def _search_assemblies_for_uniprots(
     protein_only: bool = True
 ) -> list[str]:
     """
-        Search for assemblies that contain all requested UniProt accessions (ignoring multiplicities here),
-        plus assembly-level constraints. Multiplicity is enforced later.
-        """
-    out = []
+    Search for assemblies that contain all requested UniProt accessions (ignoring multiplicities here),
+    plus assembly-level constraints. Multiplicity & exact-set are enforced later.
+    """
+    out: list[str] = []
     if not uniprots:
         return out
 
@@ -358,17 +358,17 @@ def _search_assemblies_for_uniprots(
     )
 
     if len(uniq) == 1:
-        # true homomer → exactly one polymer entity type in the assembly
+        # true homomer → exactly one distinct polymer entity
         entity_count_q = AttributeQuery(
             "rcsb_assembly_info.polymer_entity_count",
             operator="equals",
             value=1
         )
     else:
-        # heteromer → at least as many distinct entities as requested uniques
+        # heteromer → exactly as many distinct polymer entities as requested uniques
         entity_count_q = AttributeQuery(
             "rcsb_assembly_info.polymer_entity_count",
-            operator="greater_or_equal",
+            operator="equals",
             value=len(uniq)
         )
 
@@ -546,14 +546,20 @@ def _assemblies_uniprot_instance_counts(assembly_ids: list[str]) -> dict[str, di
 
 def _filter_assemblies_by_uniprot_counts(assembly_ids: list[str], uniprots: list[str]) -> list[str]:
     """
-    Enforce multiplicities exactly (e.g., ["P04626","P04626"] → require ≥2 instances of P04626).
+    Keep assemblies iff:
+      (a) the UniProt ID **set** present in the assembly is **exactly** the requested set, and
+      (b) each requested UniProt appears with **≥** the requested multiplicity.
+    Examples:
+      - ["A","B"] → present set must be {A,B} (no extras like peptides).
+      - ["P04626","P04626"] → present set {P04626} and count ≥ 2.
     """
-    want = Counter(uniprots)  # e.g., {"P04626": 2} or {"A": 1, "B": 1}
+    want = Counter(uniprots)
+    want_set = set(want.keys())
     counts = _assemblies_uniprot_instance_counts(assembly_ids)  # {aid: {up: n_instances}}
-    keep = []
-    for aid in assembly_ids:
-        c = counts.get(aid, {})
-        if all(c.get(up, 0) >= need for up, need in want.items()):
+    keep: list[str] = []
+    for aid, c in counts.items():
+        present_set = set(c.keys())
+        if present_set == want_set and all(c.get(up, 0) >= need for up, need in want.items()):
             keep.append(aid)
     return keep
 
@@ -693,6 +699,83 @@ def download_assembly_cif(assembly_key: str) -> str:
     return out
 
 
+def fetch_sifts_segments(pdb_id: str, timeout: int = 60) -> dict[str, list[dict]]:
+    """
+    Uses https://www.ebi.ac.uk/pdbe/api/v2/mappings/uniprot/{pdb_id}
+    Returns: { chain: [ {acc, start_label, end_label, unp_start}, ... ] }
+    (Segments without label bounds are skipped intentionally.)
+    """
+    pid = pdb_id.lower().strip()
+    url = f"https://www.ebi.ac.uk/pdbe/api/v2/mappings/uniprot/{pid}"
+    j = requests.get(url, timeout=timeout).json()
+    uni = (j.get(pid) or {}).get("UniProt") or {}
+
+    out: dict[str, list[dict]] = {}
+    for acc, info in uni.items():
+        for m in info.get("mappings", []) or []:
+            chain = (m.get("struct_asym_id") or "").strip()
+            if not chain:
+                continue
+            s, e = m.get("start") or {}, m.get("end") or {}
+            # keep only segments that provide SEQRES/label bounds
+            if not (isinstance(s.get("residue_number"), int) and isinstance(e.get("residue_number"), int)):
+                continue
+            unp_s = m.get("unp_start")
+            if not isinstance(unp_s, int):
+                continue
+            out.setdefault(chain, []).append({
+                "acc": acc,
+                "start_label": int(s["residue_number"]),
+                "end_label": int(e["residue_number"]),
+                "unp_start": int(unp_s),
+            })
+    return out
+
+
+def add_uniprot_from_sifts(df_atoms: pd.DataFrame, segs_by_chain: dict[str, list[dict]]) -> pd.DataFrame:
+    """
+    Minimal, label-only application:
+    For each segment on a chain, set:
+      uniprot_pos = unp_start + (resnum_label - start_label)
+    for rows with start_label <= resnum_label <= end_label.
+    Never sorts, never drops, never adds temp columns.
+    """
+    if df_atoms.empty:
+        out = df_atoms.copy()
+        out["uniprot_acc"] = None
+        out["resnum_uniprot"] = np.nan
+        return out
+
+    df = df_atoms.copy()
+    if "uniprot_acc" not in df.columns:
+        df["uniprot_acc"] = None
+    if "resnum_uniprot" not in df.columns:
+        df["resnum_uniprot"] = np.nan
+
+    # ensure resnum_label is numeric for arithmetic; leave NaNs untouched
+    reslab = pd.to_numeric(df["resnum_label"], errors="coerce")
+
+    for chain, segs in (segs_by_chain or {}).items():
+        if not segs:
+            continue
+        chain_mask = (df["chain"] == chain)
+        if not chain_mask.any():
+            continue
+        for seg in segs:
+            s_lbl = seg["start_label"]
+            e_lbl = seg["end_label"]
+            up0 = seg["unp_start"]
+            # mask rows in this chain within the label range
+            m = chain_mask & reslab.ge(s_lbl) & reslab.le(e_lbl)
+            if not m.any():
+                continue
+            # compute uniprot_pos from label offset
+            df.loc[m, "uniprot_acc"] = seg["acc"]
+            df.loc[m, "resnum_uniprot"] = up0 + (reslab[m] - s_lbl).astype("Int64")
+
+    return df
+
+
 def _write_assemblies_safetensors(
     df_assemblies: pd.DataFrame,
     structures_dir: str,
@@ -724,7 +807,7 @@ def _write_assemblies_safetensors(
     torch.set_num_threads(1)
     os.makedirs(structures_dir, exist_ok=True)
 
-    df_filt = df_assemblies.loc[df_assemblies["atom_name"].isin(COORDS_ORDER)]
+    df_filt = df_assemblies.loc[df_assemblies["atom_name"].isin(COORDS_ORDER)].copy()
 
     # always define chain_to_encoding
     chain_to_encoding: dict[str, str] = {}
@@ -740,7 +823,8 @@ def _write_assemblies_safetensors(
             "residue_idx": torch.empty((0,), dtype=torch.int32),
         }
     else:
-        df_filt_res = df_filt.groupby(["chain", "resnum_label", "res_name_1"], as_index=False).size()
+        df_filt["abs_pos_label"] = df_filt["abs_pos_label"].fillna(-1).astype(int)
+        df_filt_res = df_filt.groupby(["chain", "resnum_label", "res_name_1", "abs_pos_label"], as_index=False).size()
         df_filt_res = df_filt_res.drop(columns=["size"])
 
         # Atom coordinates grouped by atom_name after filtering to COORDS_ORDER
@@ -753,7 +837,7 @@ def _write_assemblies_safetensors(
         x_grouped = np.stack([x_grouped_dict[a] for a in COORDS_ORDER if a in x_grouped_dict], axis=-2)
 
         # Positions of residues in the chain
-        resnums = df_filt_res["resnum_label"].values
+        resnums = df_filt_res["abs_pos_label"].values
 
         # Amino acid sequences expressed as integers
         resnames = df_filt_res["res_name_1"]
@@ -814,8 +898,14 @@ def fetch_assembly_atoms_df(
     Returns (df_assemblies, metadata).
     """
     try:
+        entry_id = normalize_entry(assembly_key)
+        chain_map = _fetch_chain_to_uniprot_map_rcsb(entry_id)
+        if chains is None:
+            chains = list(chain_map.keys())  # Making sure that we are only saving chains that are in the assembly
+
         cif_string = download_assembly_cif(assembly_key)
         st = _read_structure_from_text(cif_string, fmt="cif")
+
         df = _structure_to_atom_dataframe(
             st,
             chains=chains,
@@ -823,8 +913,12 @@ def fetch_assembly_atoms_df(
             include_het=include_het,
             prefer_label_seq=prefer_label_seq,
         )
+        segments = fetch_sifts_segments(entry_id)
+        df = add_uniprot_from_sifts(df, segments)
+        df["item_id"] = assembly_key  # Adding assembly_key as an ID to DataFrame
+        df["abs_pos_label"] = df["resnum_uniprot"]
+
         entry_id = normalize_entry(assembly_key)
-        chain_map = _fetch_chain_to_uniprot_map_rcsb(entry_id)
         chain_map = {k: chain_map[k] for k in df["chain"].unique() if k in chain_map}
         metadata = chain_map | {
             "biological_assembly": assembly_key,
@@ -1109,9 +1203,9 @@ class IntactDataController:
         df["resulting_sequence"] = df["resulting_sequence"].fillna("")
 
         # Extracting start and end positions of mutations
-        df['feature_ranges_start'] = df['feature_ranges'].str.split('-').str[0].astype(int)
-        df['feature_ranges_end'] = df['feature_ranges'].str.split('-').str[-1].astype(int)
-        df['feature_ranges_start'] -= 1  # Index is 1-based
+        df["feature_ranges_start"] = df["feature_ranges"].str.split("-").str[0].astype(int)
+        df["feature_ranges_end"] = df["feature_ranges"].str.split("-").str[-1].astype(int)
+        df["feature_ranges_start"] -= 1  # Index is 1-based
 
         df = df.reset_index()
 
@@ -1133,6 +1227,7 @@ class IntactDataController:
             ignore_index=True
         ).unique().tolist()
 
+        # TODO fasta_map is not needed since structures are being obtained from _fetch_alphafold_structure
         fasta_map = fetch_uniprot_sequences(uniprot_codes, batch_size=100)
 
         self.df["participant_protein_seq"] = self.df["participant_protein"].map(fasta_map)
@@ -1143,13 +1238,16 @@ class IntactDataController:
             how="any",
             ignore_index=True
         )
+
+        # Creating the mutation sequence by replacing the original sequence with the resulting sequence; note that
+        # SEQUENCE_DELETION ('.') in the replacement sequence indicates a deletion
         self.df["affected_protein_ac_seq_mut"] = (
             self.df.apply(
                 lambda x: (
                     x["affected_protein_ac_seq"][:x["feature_ranges_start"]] +
                     x["resulting_sequence"] +
                     x["affected_protein_ac_seq"][x["feature_ranges_end"]:]
-                ),
+                ).replace(SEQUENCE_DELETION, ""),
                 axis=1
             )
         )
