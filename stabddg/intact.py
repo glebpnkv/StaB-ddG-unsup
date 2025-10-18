@@ -242,6 +242,10 @@ def fetch_alphafold_atoms_df(
             include_het=include_het,
             prefer_label_seq=prefer_label_seq,
         )
+        # Getting the representative model if available
+        df = df.loc[df["model"] == 0].copy()
+        df = df.reset_index(drop=True)
+
         df["item_id"] = uniprot_or_pro  # Adding uniprot_or_pro as an ID to DataFrame
         df["abs_pos_label"] = df["resnum_label"]
 
@@ -496,7 +500,7 @@ def _pdbe_mutations(pdb_id):
     """
     muts = {}
     for ep in ("mutated_residues", "modified_residues"):
-        u = f"https://www.ebi.ac.uk/pdbe/graph-api/pdb/{ep}/{pdb_id}"
+        u = f"https://www.ebi.ac.uk/pdbe/api/v2/pdb/{ep}/{pdb_id}"
         try:
             r = requests.get(u, timeout=30)
             if r.ok:
@@ -699,7 +703,10 @@ def download_assembly_cif(assembly_key: str) -> str:
     return out
 
 
-def fetch_sifts_segments(pdb_id: str, timeout: int = 60) -> dict[str, list[dict]]:
+def fetch_sifts_segments(
+    pdb_id: str,
+    timeout: int = 60
+) -> dict[str, list[dict]]:
     """
     Uses https://www.ebi.ac.uk/pdbe/api/v2/mappings/uniprot/{pdb_id}
     Returns: { chain: [ {acc, start_label, end_label, unp_start}, ... ] }
@@ -732,7 +739,10 @@ def fetch_sifts_segments(pdb_id: str, timeout: int = 60) -> dict[str, list[dict]
     return out
 
 
-def add_uniprot_from_sifts(df_atoms: pd.DataFrame, segs_by_chain: dict[str, list[dict]]) -> pd.DataFrame:
+def add_uniprot_from_sifts(
+    df_atoms: pd.DataFrame,
+    segs_by_chain: dict[str, list[dict]]
+) -> pd.DataFrame:
     """
     Minimal, label-only application:
     For each segment on a chain, set:
@@ -812,7 +822,7 @@ def _write_assemblies_safetensors(
     # always define chain_to_encoding
     chain_to_encoding: dict[str, str] = {}
 
-    # Build per-atom tensors in the same structure as _worker_write_safetensors_batch
+    # Build per-atom tensors
     if df_filt.empty:
         cur_tensor = {
             "X": torch.empty((0, 3), dtype=torch.float32),
@@ -905,7 +915,7 @@ def fetch_assembly_atoms_df(
 
         cif_string = download_assembly_cif(assembly_key)
         st = _read_structure_from_text(cif_string, fmt="cif")
-
+        block = gemmi.cif.read_string(cif_string).sole_block()
         df = _structure_to_atom_dataframe(
             st,
             chains=chains,
@@ -913,6 +923,13 @@ def fetch_assembly_atoms_df(
             include_het=include_het,
             prefer_label_seq=prefer_label_seq,
         )
+
+        # Getting the representative model if available
+        rep = block.find_value('_pdbx_nmr_representative.conformer_id')  # string or None
+        model_idx = int(rep) - 1 if rep and rep.isdigit() else 0
+        df = df.loc[df["model"] == model_idx].copy()
+        df = df.reset_index(drop=True)
+
         segments = fetch_sifts_segments(entry_id)
         df = add_uniprot_from_sifts(df, segments)
         df["item_id"] = assembly_key  # Adding assembly_key as an ID to DataFrame
@@ -992,89 +1009,6 @@ def fetch_assemblies_atoms_parallel(
             results[code] = out
 
     return results
-
-
-def _worker_write_safetensors(cur_uniprot, df_structures, structures_dir):
-    # Keep PyTorch single-threaded in workers to avoid CPU oversubscription
-    torch.set_num_threads(1)
-
-    df_sample = df_structures.loc[df_structures["uniprot_code"] == cur_uniprot]
-
-    # Creating a dict of arrays per sidechain atom
-    cur_tensor = df_sample.sort_values(
-        by=["resnum_auth", "atom_name"]
-    ).groupby("atom_name")[["x", "y", "z"]].apply(lambda x: x.values).to_dict()
-
-    cur_tensor = {
-        k: torch.from_numpy(v).float().contiguous()
-        for k, v in cur_tensor.items()
-    }
-
-    out_path = os.path.join(structures_dir, f"{cur_uniprot}.safetensors")
-    save_file(cur_tensor, out_path)
-    return cur_uniprot, out_path
-
-
-def _worker_write_safetensors_batch(
-    batch_items: list[tuple[str, pd.DataFrame]],
-    structures_dir: str
-) -> list[tuple[str, str]]:
-    """
-    Process a batch of (uniprot_code, df_group) pairs in one worker.
-    Returns list of (code, out_path).
-    """
-    # Avoid CPU oversubscription inside each process
-    torch.set_num_threads(1)
-    out: list[tuple[str, str]] = []
-    for cur_uniprot, df_group in batch_items:
-        df_filt_res = df_group.groupby(["chain", "resnum_label", "res_name_1"], as_index=False).size()
-        df_filt_res = df_filt_res.drop(columns=["size"])
-        # Creating a dict of arrays per sidechain atom
-        cur_tensor = (
-            df_group.sort_values(by=["chain", "resnum_label", "atom_name"])
-            .groupby("atom_name")[["x", "y", "z"]]
-            .apply(lambda x: x.values)
-            .to_dict()
-        )
-        x_grouped = np.stack([cur_tensor[a] for a in COORDS_ORDER if a in cur_tensor], axis=-2)
-
-        # Positions of residues in the chain
-        resnums = df_filt_res["resnum_label"].values
-
-        # Amino acid sequences expressed as integers
-        resnames = df_filt_res["res_name_1"]
-        seq_list = [ch if ch in ALPHABET else SEQUENCE_UNKNOWN for ch in resnames]
-        seq_list = np.asarray([ALPHABET.index(ch) for ch in seq_list], dtype=np.int32)
-
-        # IDs of chains
-        chain_encoding_all = (df_filt_res["chain"] != df_filt_res["chain"].shift().bfill()).cumsum()
-        chain_encoding_all = chain_encoding_all.values
-
-        # Mask: having ones everywhere means predictions are required for every amino acid
-        mask = torch.ones(len(chain_encoding_all))
-
-        residue_idx = torch.arange(len(chain_encoding_all)) + 100 * torch.from_numpy(chain_encoding_all)
-
-        cur_tensor = {
-            "X": torch.from_numpy(x_grouped).float().contiguous(),
-            "resnums": torch.from_numpy(resnums).int().contiguous(),
-            "S": torch.from_numpy(seq_list).int().contiguous(),
-            "chain_encoding_all": torch.from_numpy(chain_encoding_all + 1).int().contiguous(),
-            "mask": mask,
-            "residue_idx": residue_idx.int().contiguous(),
-        }
-
-        metadata = {
-            "entry_id": cur_uniprot,
-            "A": cur_uniprot,
-            "chain_encoding:1": "A"
-        }
-
-        out_path = os.path.join(structures_dir, f"{cur_uniprot}.safetensors")
-        save_file(cur_tensor, out_path, metadata=metadata)
-        out.append((cur_uniprot, out_path))
-
-    return out
 
 
 class IntactDataController:
