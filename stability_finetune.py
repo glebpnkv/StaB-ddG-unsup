@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from stabddg.model import StaBddG
 from stabddg.mpnn_utils import StructureDataset, ProteinMPNN, parse_PDB
-from training import _is_dist_initialized, _is_main_process, _unwrap_model
+from training import _is_dist_initialized, _is_main_process, _unwrap_model, _distributed_concat_1d
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -136,28 +136,6 @@ def finetune(
         pin_memory=True,
     )
 
-    def _distributed_concat_1d(t: torch.Tensor) -> torch.Tensor:
-        """Concatenate variable-length 1D tensors from all ranks."""
-        if not _is_dist_initialized():
-            return t
-        local_len = torch.tensor([t.numel()], device=t.device, dtype=torch.long)
-        lens = [torch.zeros_like(local_len) for _ in range(world_size)]
-        dist.all_gather(lens, local_len)
-        max_len = int(torch.max(torch.stack(lens)).item())
-        # pad to max_len
-        pad_len = max_len - t.numel()
-        if pad_len > 0:
-            t_padded = torch.cat([t, torch.empty(pad_len, device=t.device, dtype=t.dtype)])
-        else:
-            t_padded = t
-        gathered = [torch.empty_like(t_padded) for _ in range(world_size)]
-        dist.all_gather(gathered, t_padded)
-        # trim per rank by its true length and concat
-        outs = []
-        for g, l in zip(gathered, lens):
-            outs.append(g[: int(l.item())])
-        return torch.cat(outs, dim=0)
-
     def run_eval(dloader: DataLoader) -> dict[str, float | None]:
         """Validation/test epoch across all ranks with DistributedSampler splitting."""
         _unwrap_model(model).eval()
@@ -214,8 +192,8 @@ def finetune(
             local_pred = torch.empty(0, device=device)
             local_labels = torch.empty(0, device=device)
 
-        all_pred = _distributed_concat_1d(local_pred)
-        all_labels = _distributed_concat_1d(local_labels)
+        all_pred = _distributed_concat_1d(world_size, local_pred)
+        all_labels = _distributed_concat_1d(world_size, local_labels)
 
         # Compute global metrics only on rank 0 to avoid redundant work
         all_sp = None
@@ -244,6 +222,10 @@ def finetune(
             "all_spearman": all_sp,
             "all_pearson": all_pr,
         }
+
+
+    # TODO complete the logic which writes all train / valid /
+    df_predictions = pd.DataFrame()
 
     for epoch in tqdm(range(args.num_epochs), desc="Epoch") if _is_main_process() else range(args.num_epochs):
         if train_sampler is not None:
@@ -276,6 +258,7 @@ def finetune(
                 B = min(N - batch_idx, M)
                 optimizer.zero_grad(set_to_none=True)
 
+                # TODO track all predictions for each epoch - create a dataframe for each epoch
                 # ddG prediction
                 pred = _unwrap_model(model).folding_ddG(sample, mut_seqs[batch_idx: batch_idx + B])
 

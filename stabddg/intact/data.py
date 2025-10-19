@@ -20,8 +20,14 @@ from safetensors.torch import save_file
 from tqdm import tqdm
 from urllib3.util.retry import Retry
 
-from stabddg.constants import AA3_TO_1, ALPHABET, COORDS_ORDER, SEQUENCE_DELETION, SEQUENCE_UNKNOWN
-from stabddg.uniprot import fetch_uniprot_sequences
+from stabddg.constants import (
+    AA3_TO_1,
+    ALPHABET,
+    COORDS_ORDER,
+    SEQUENCE_DELETION,
+    SEQUENCE_UNKNOWN,
+)
+from intact.uniprot import fetch_uniprot_sequences
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -53,7 +59,9 @@ def _build_retrying_session() -> requests.Session:
         adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
         s.mount("https://", adapter)
         s.mount("http://", adapter)
-    s.headers.update({"User-Agent": "stabddg/parallel-fetch (https://alphafold.ebi.ac.uk/)"})
+    s.headers.update(
+        {"User-Agent": "stabddg/parallel-fetch (https://alphafold.ebi.ac.uk/)"}
+    )
     return s
 
 
@@ -68,6 +76,7 @@ def _get_thread_session() -> requests.Session:
 # ---------------------------------------------------------------------------
 # Low-level parsers — turn structure text into (N,3) CA coordinates + annotations
 # ---------------------------------------------------------------------------
+
 
 def _read_structure_from_text(text: str, fmt: str) -> gemmi.Structure:
     """Create a gemmi.Structure from in-memory text.
@@ -134,38 +143,45 @@ def _structure_to_atom_dataframe(
                 auth_num = res.seqid.num if hasattr(res, "seqid") else None
                 ins_code = res.seqid.icode if hasattr(res, "seqid") else ""
                 label_seq = int(getattr(res, "label_seq", 0) or 0)
-                resnum_label = int(label_seq) if (prefer_label_seq and label_seq != 0) else None
+                resnum_label = (
+                    int(label_seq) if (prefer_label_seq and label_seq != 0) else None
+                )
 
-                for at in res.first_conformer():  # gemmi.Atom - picks a single altloc per atom group
+                for at in (
+                    res.first_conformer()
+                ):  # gemmi.Atom - picks a single altloc per atom group
                     atom_name = at.name.strip()
                     if atoms is not None and atom_name not in atoms:
                         continue
-                    rows.append({
-                        "model": model_idx,
-                        "chain": chain_id,
-                        "res_name_3": aa3,
-                        "res_name_1": aa1,
-                        "resnum_label": resnum_label,
-                        "resnum_auth": auth_num,
-                        "ins_code": ins_code,
-                        "atom_name": atom_name,
-                        "element": at.element.name,
-                        "altloc": (at.altloc if at.has_altloc() else ""),
-                        "occupancy": float(at.occ),
-                        "b_factor": float(at.b_iso),
-                        "x": float(at.pos.x),
-                        "y": float(at.pos.y),
-                        "z": float(at.pos.z),
-                        "is_het": is_het,
-                    })
+                    rows.append(
+                        {
+                            "model": model_idx,
+                            "chain": chain_id,
+                            "res_name_3": aa3,
+                            "res_name_1": aa1,
+                            "resnum_label": resnum_label,
+                            "resnum_auth": auth_num,
+                            "ins_code": ins_code,
+                            "atom_name": atom_name,
+                            "element": at.element.name,
+                            "altloc": (at.altloc if at.has_altloc() else ""),
+                            "occupancy": float(at.occ),
+                            "b_factor": float(at.b_iso),
+                            "x": float(at.pos.x),
+                            "y": float(at.pos.y),
+                            "z": float(at.pos.z),
+                            "is_het": is_het,
+                        }
+                    )
 
     return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
-# 1) AlphaFold DB — wild type by UniProt ID -> (N,3) + annotations
-#    Follows your template and prefers mmCIF when available.
+# 1) AlphaFold DB — wild type by UniProt ID -> (N,3) + annotations.
+#    Prefers mmCIF when available.
 # ---------------------------------------------------------------------------
+
 
 def _fetch_alphafold_structure(
     uniprot_acc: str,
@@ -212,14 +228,15 @@ def _fetch_alphafold_structure(
 # Atom dataframe helper (PDB or CIF) for AlphaFold entries
 # ---------------------------------------------------------------------------
 
+
 def fetch_alphafold_atoms_df(
     uniprot_or_pro: str,
     *,
-    prefer_format: str = "pdb",           # "pdb" if you want strict compatibility with PDB-centric tooling
+    prefer_format: str = "pdb",  # "pdb" if you want strict compatibility with PDB-centric tooling
     chains: set[str] | None = None,
-    atoms: set[str] | None = None,        # e.g., {"N","CA","C","O"} or None for all atoms
-    include_het: bool = False,            # include waters/ligands if True
-    prefer_label_seq: bool = True,        # mmCIF label_seq where present
+    atoms: set[str] | None = None,  # e.g., {"N","CA","C","O"} or None for all atoms
+    include_het: bool = False,  # include waters/ligands if True
+    prefer_label_seq: bool = True,  # mmCIF label_seq where present
 ) -> dict:
     """
     Return a dict with:
@@ -234,7 +251,9 @@ def fetch_alphafold_atoms_df(
 
     try:
         ses = _get_thread_session()
-        st, url, fmt = _fetch_alphafold_structure(uniprot_or_pro, session=ses, prefer_format=prefer_format)
+        st, url, fmt = _fetch_alphafold_structure(
+            uniprot_or_pro, session=ses, prefer_format=prefer_format
+        )
         df = _structure_to_atom_dataframe(
             st,
             chains=chains,
@@ -260,7 +279,7 @@ def fetch_alphafold_atoms_df(
             "df": df,
             "source_url": url,
             "format": fmt,
-            "metadata": metadata
+            "metadata": metadata,
         }
     except Exception as e:
         return {"status": str(e)}
@@ -302,7 +321,9 @@ def fetch_alphafold_atoms_parallel(
                 out["df"].to_parquet(parquet_path, index=False)
                 out["parquet_path"] = parquet_path
             if safetensors_dir is not None:
-                st_path = _write_assemblies_safetensors(out["df"], safetensors_dir, code, metadata=out["metadata"])
+                st_path = _write_assemblies_safetensors(
+                    out["df"], safetensors_dir, code, metadata=out["metadata"]
+                )
                 out["safetensors_path"] = st_path
             # include df only if not saving to reduce memory
             if parquet_dir is not None and safetensors_dir is not None:
@@ -327,9 +348,9 @@ def fetch_alphafold_atoms_parallel(
 # 2) Assemblies helpers
 # ---------------------------------------------------------------------------
 
+
 def _search_assemblies_for_uniprots(
-    uniprots: list[str],
-    protein_only: bool = True
+    uniprots: list[str], protein_only: bool = True
 ) -> list[str]:
     """
     Search for assemblies that contain all requested UniProt accessions (ignoring multiplicities here),
@@ -346,11 +367,13 @@ def _search_assemblies_for_uniprots(
     for up in uniq:
         q_acc = AttributeQuery(
             "rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_accession",
-            operator="exact_match", value=up
+            operator="exact_match",
+            value=up,
         )
         q_db = AttributeQuery(
             "rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_name",
-            operator="exact_match", value="UniProt"
+            operator="exact_match",
+            value="UniProt",
         )
         groups.append(NestedAttributeQuery(q_acc, q_db))
 
@@ -358,31 +381,31 @@ def _search_assemblies_for_uniprots(
     at_least_two_protein_chains = AttributeQuery(
         "rcsb_assembly_info.polymer_entity_instance_count_protein",
         operator="greater_or_equal",
-        value=2
+        value=2,
     )
 
     if len(uniq) == 1:
         # true homomer → exactly one distinct polymer entity
         entity_count_q = AttributeQuery(
-            "rcsb_assembly_info.polymer_entity_count",
-            operator="equals",
-            value=1
+            "rcsb_assembly_info.polymer_entity_count", operator="equals", value=1
         )
     else:
         # heteromer → exactly as many distinct polymer entities as requested uniques
         entity_count_q = AttributeQuery(
             "rcsb_assembly_info.polymer_entity_count",
             operator="equals",
-            value=len(uniq)
+            value=len(uniq),
         )
 
     extra = [at_least_two_protein_chains, entity_count_q]
     if protein_only:
-        extra.append(AttributeQuery(
-            "rcsb_entry_info.selected_polymer_entity_types",
-            operator="exact_match",
-            value="Protein (only)"
-        ))
+        extra.append(
+            AttributeQuery(
+                "rcsb_entry_info.selected_polymer_entity_types",
+                operator="exact_match",
+                value="Protein (only)",
+            )
+        )
 
     query = reduce(op.and_, groups + extra)
     try:
@@ -428,16 +451,20 @@ def _entries_meta_and_refs(pdb_ids):
             res = min([v for v in rc if isinstance(v, (int, float))], default=None)
         if res is None:
             em = e.get("em_3d_reconstruction") or []
-            em_res = [d.get("resolution") for d in em if d.get("resolution") is not None]
+            em_res = [
+                d.get("resolution") for d in em if d.get("resolution") is not None
+            ]
             if em_res:
                 res = min(em_res)
 
         # UniProt set present in entry polymer entities
         ups = set()
-        for pe in (e.get("polymer_entities") or []):
-            cont = (pe.get("rcsb_polymer_entity_container_identifiers") or {})
-            for ref in (cont.get("reference_sequence_identifiers") or []):
-                if ref.get("database_name") == "UniProt" and ref.get("database_accession"):
+        for pe in e.get("polymer_entities") or []:
+            cont = pe.get("rcsb_polymer_entity_container_identifiers") or {}
+            for ref in cont.get("reference_sequence_identifiers") or []:
+                if ref.get("database_name") == "UniProt" and ref.get(
+                    "database_accession"
+                ):
                     ups.add(ref["database_accession"])
         out[pdb_id] = {"method": method, "best_resolution": res, "uniprots": ups}
     return out
@@ -471,10 +498,12 @@ def _fetch_chain_to_uniprot_map_rcsb(pdb_id: str) -> dict[str, str]:
         refs = cont.get("reference_sequence_identifiers") or []
         # take the first UniProt xref if present
         unp = next(
-            (r.get("database_accession")
-             for r in refs
-             if (r.get("database_name") or "").lower() in ("uniprot", "unp")),
-            ""
+            (
+                r.get("database_accession")
+                for r in refs
+                if (r.get("database_name") or "").lower() in ("uniprot", "unp")
+            ),
+            "",
         )
         if not unp:
             continue
@@ -504,15 +533,15 @@ def _pdbe_mutations(pdb_id):
         try:
             r = requests.get(u, timeout=30)
             if r.ok:
-                muts.update(
-                    (r.json() or {}).get(pdb_id, {})
-                )
+                muts.update((r.json() or {}).get(pdb_id, {}))
         except Exception:
             pass
     return muts
 
 
-def _assemblies_uniprot_instance_counts(assembly_ids: list[str]) -> dict[str, dict[str, int]]:
+def _assemblies_uniprot_instance_counts(
+    assembly_ids: list[str],
+) -> dict[str, dict[str, int]]:
     """
     For each assembly (e.g. '4HHB-1'), count how many polymer_entity_instances
     map to each UniProt accession.
@@ -537,18 +566,22 @@ def _assemblies_uniprot_instance_counts(assembly_ids: list[str]) -> dict[str, di
     for asm in data:
         asm_id = asm["rcsb_id"]
         counts = defaultdict(int)
-        for inst in (asm.get("polymer_entity_instances") or []):
+        for inst in asm.get("polymer_entity_instances") or []:
             poly = inst.get("polymer_entity") or {}
             cont = poly.get("rcsb_polymer_entity_container_identifiers") or {}
-            for ref in (cont.get("reference_sequence_identifiers") or []):
-                if ref.get("database_name") == "UniProt" and ref.get("database_accession"):
+            for ref in cont.get("reference_sequence_identifiers") or []:
+                if ref.get("database_name") == "UniProt" and ref.get(
+                    "database_accession"
+                ):
                     counts[ref["database_accession"]] += 1
                     break  # count each instance once
         out[asm_id] = dict(counts)
     return out
 
 
-def _filter_assemblies_by_uniprot_counts(assembly_ids: list[str], uniprots: list[str]) -> list[str]:
+def _filter_assemblies_by_uniprot_counts(
+    assembly_ids: list[str], uniprots: list[str]
+) -> list[str]:
     """
     Keep assemblies iff:
       (a) the UniProt ID **set** present in the assembly is **exactly** the requested set, and
@@ -559,11 +592,15 @@ def _filter_assemblies_by_uniprot_counts(assembly_ids: list[str], uniprots: list
     """
     want = Counter(uniprots)
     want_set = set(want.keys())
-    counts = _assemblies_uniprot_instance_counts(assembly_ids)  # {aid: {up: n_instances}}
+    counts = _assemblies_uniprot_instance_counts(
+        assembly_ids
+    )  # {aid: {up: n_instances}}
     keep: list[str] = []
     for aid, c in counts.items():
         present_set = set(c.keys())
-        if present_set == want_set and all(c.get(up, 0) >= need for up, need in want.items()):
+        if present_set == want_set and all(
+            c.get(up, 0) >= need for up, need in want.items()
+        ):
             keep.append(aid)
     return keep
 
@@ -591,22 +628,28 @@ def rank_assemblies(assembly_ids, uniprots):
 
         muts = _pdbe_mutations(pdb_id)  # PDBe Graph API
         mut_penalty = 1 if muts else 0
-        method_bonus = 0 if "X-RAY" in method else (0.25 if "ELECTRON" in method else 0.5)
+        method_bonus = (
+            0 if "X-RAY" in method else (0.25 if "ELECTRON" in method else 0.5)
+        )
         res_use = res if isinstance(res, (int, float)) else 9.99
 
         score = (0 if has_both else 10) + mut_penalty + method_bonus + (res_use / 10.0)
-        ranked.append({
-            "biological_assembly": aid,
-            "score": score,
-            "method": m.get("method"),
-            "resolution": res,
-            "has_both": has_both,
-            "mutations": muts
-        })
+        ranked.append(
+            {
+                "biological_assembly": aid,
+                "score": score,
+                "method": m.get("method"),
+                "resolution": res,
+                "has_both": has_both,
+                "mutations": muts,
+            }
+        )
     return sorted(ranked, key=lambda x: x["score"])
 
 
-def fetch_assemblies_for_uniprots(uniprots: list[str]) -> list[dict[str, str | float | bool]] | None:
+def fetch_assemblies_for_uniprots(
+    uniprots: list[str],
+) -> list[dict[str, str | float | bool]] | None:
     # Getting assemblies for UniProt accessions
     assembly_ids = _search_assemblies_for_uniprots(uniprots)
 
@@ -632,11 +675,14 @@ def fetch_assemblies_for_uniprots_parallel(
       - uniprot_1, uniprot_2: the pair values as columns
       - plus all fields returned by rank_assemblies for each assembly (or NaNs if None)
     """
+
     def _task(idx: int, pair: list[str]) -> tuple[int, list[str], list[dict] | None]:
         try:
             out = fetch_assemblies_for_uniprots(pair)
         except Exception as e:
-            logger.error(f"Error fetching assemblies for UniProt accessions {pair}: {e}")
+            logger.error(
+                f"Error fetching assemblies for UniProt accessions {pair}: {e}"
+            )
             out = None
         # Ensure pair length 2 for consistent columns
         a = pair[0] if len(pair) > 0 else None
@@ -653,31 +699,36 @@ def fetch_assemblies_for_uniprots_parallel(
             idx, (u1, u2), ranked = fut.result()
             if ranked is None or len(ranked) == 0:
                 # One row with NaNs for assembly fields
-                rows.append({
-                    "pair_idx": idx,
-                    "participant_protein": u1,
-                    "affected_protein_ac": u2,
-                    "assembly_id": None,
-                    "score": None,
-                    "method": None,
-                    "resolution": None,
-                    "has_both": None,
-                    "mutations": None,
-                })
-            else:
-                for r in ranked:
-                    rows.append({
+                rows.append(
+                    {
                         "pair_idx": idx,
                         "participant_protein": u1,
                         "affected_protein_ac": u2,
-                        **r,
-                    })
+                        "assembly_id": None,
+                        "score": None,
+                        "method": None,
+                        "resolution": None,
+                        "has_both": None,
+                        "mutations": None,
+                    }
+                )
+            else:
+                for r in ranked:
+                    rows.append(
+                        {
+                            "pair_idx": idx,
+                            "participant_protein": u1,
+                            "affected_protein_ac": u2,
+                            **r,
+                        }
+                    )
 
     # Preparing output DataFrame
     df_out = pd.DataFrame(rows)
     df_out = df_out.sort_values(by=["pair_idx", "score"], ignore_index=True)
 
     return df_out
+
 
 def normalize_entry(s: str) -> str:
     # Accept stuff like '8CT8', '8CT8-1', '8CT8_2', '8ct8'
@@ -703,10 +754,7 @@ def download_assembly_cif(assembly_key: str) -> str:
     return out
 
 
-def fetch_sifts_segments(
-    pdb_id: str,
-    timeout: int = 60
-) -> dict[str, list[dict]]:
+def fetch_sifts_segments(pdb_id: str, timeout: int = 60) -> dict[str, list[dict]]:
     """
     Uses https://www.ebi.ac.uk/pdbe/api/v2/mappings/uniprot/{pdb_id}
     Returns: { chain: [ {acc, start_label, end_label, unp_start}, ... ] }
@@ -725,23 +773,27 @@ def fetch_sifts_segments(
                 continue
             s, e = m.get("start") or {}, m.get("end") or {}
             # keep only segments that provide SEQRES/label bounds
-            if not (isinstance(s.get("residue_number"), int) and isinstance(e.get("residue_number"), int)):
+            if not (
+                isinstance(s.get("residue_number"), int)
+                and isinstance(e.get("residue_number"), int)
+            ):
                 continue
             unp_s = m.get("unp_start")
             if not isinstance(unp_s, int):
                 continue
-            out.setdefault(chain, []).append({
-                "acc": acc,
-                "start_label": int(s["residue_number"]),
-                "end_label": int(e["residue_number"]),
-                "unp_start": int(unp_s),
-            })
+            out.setdefault(chain, []).append(
+                {
+                    "acc": acc,
+                    "start_label": int(s["residue_number"]),
+                    "end_label": int(e["residue_number"]),
+                    "unp_start": int(unp_s),
+                }
+            )
     return out
 
 
 def add_uniprot_from_sifts(
-    df_atoms: pd.DataFrame,
-    segs_by_chain: dict[str, list[dict]]
+    df_atoms: pd.DataFrame, segs_by_chain: dict[str, list[dict]]
 ) -> pd.DataFrame:
     """
     Minimal, label-only application:
@@ -768,7 +820,7 @@ def add_uniprot_from_sifts(
     for chain, segs in (segs_by_chain or {}).items():
         if not segs:
             continue
-        chain_mask = (df["chain"] == chain)
+        chain_mask = df["chain"] == chain
         if not chain_mask.any():
             continue
         for seg in segs:
@@ -834,17 +886,21 @@ def _write_assemblies_safetensors(
         }
     else:
         df_filt["abs_pos_label"] = df_filt["abs_pos_label"].fillna(-1).astype(int)
-        df_filt_res = df_filt.groupby(["chain", "resnum_label", "res_name_1", "abs_pos_label"], as_index=False).size()
+        df_filt_res = df_filt.groupby(
+            ["chain", "resnum_label", "res_name_1", "abs_pos_label"], as_index=False
+        ).size()
         df_filt_res = df_filt_res.drop(columns=["size"])
 
         # Atom coordinates grouped by atom_name after filtering to COORDS_ORDER
         x_grouped_dict = (
-            df_filt.sort_values(by=["chain", "resnum_label", "atom_name"]) 
+            df_filt.sort_values(by=["chain", "resnum_label", "atom_name"])
             .groupby("atom_name")[["x", "y", "z"]]
             .apply(lambda x: x.values)
             .to_dict()
         )
-        x_grouped = np.stack([x_grouped_dict[a] for a in COORDS_ORDER if a in x_grouped_dict], axis=-2)
+        x_grouped = np.stack(
+            [x_grouped_dict[a] for a in COORDS_ORDER if a in x_grouped_dict], axis=-2
+        )
 
         # Positions of residues in the chain
         resnums = df_filt_res["abs_pos_label"].values
@@ -852,10 +908,12 @@ def _write_assemblies_safetensors(
         # Amino acid sequences expressed as integers
         resnames = df_filt_res["res_name_1"]
         seq_list = [ch if ch in ALPHABET else SEQUENCE_UNKNOWN for ch in resnames]
-        seq_list =  np.asarray([ALPHABET.index(ch) for ch in seq_list], dtype=np.int32)
+        seq_list = np.asarray([ALPHABET.index(ch) for ch in seq_list], dtype=np.int32)
 
         # IDs of chains
-        chain_encoding_all = (df_filt_res["chain"] != df_filt_res["chain"].shift().bfill()).cumsum()
+        chain_encoding_all = (
+            df_filt_res["chain"] != df_filt_res["chain"].shift().bfill()
+        ).cumsum()
         chain_encoding_all = chain_encoding_all.values
 
         # Explicit chain -> encoding map (encoding matches 'chain_encoding_all' tensor values)
@@ -863,20 +921,23 @@ def _write_assemblies_safetensors(
         first_occ = df_filt_res["chain"].ne(df_filt_res["chain"].shift()).to_numpy()
         chain_order = df_filt_res["chain"].to_numpy()[first_occ]
         chain_to_encoding = {
-            f"chain_encoding:{int(i + 1)}": str(ch)
-            for i, ch in enumerate(chain_order)
+            f"chain_encoding:{int(i + 1)}": str(ch) for i, ch in enumerate(chain_order)
         }
 
         # Mask: having ones everywhere means predictions are required for every amino acid
         mask = torch.ones(len(chain_encoding_all))
 
-        residue_idx = torch.arange(len(chain_encoding_all)) + 100 * torch.from_numpy(chain_encoding_all)
+        residue_idx = torch.arange(len(chain_encoding_all)) + 100 * torch.from_numpy(
+            chain_encoding_all
+        )
 
         cur_tensor = {
             "X": torch.from_numpy(x_grouped).float().contiguous(),
             "resnums": torch.from_numpy(resnums).int().contiguous(),
             "S": torch.from_numpy(seq_list).int().contiguous(),
-            "chain_encoding_all": torch.from_numpy(chain_encoding_all + 1).int().contiguous(),
+            "chain_encoding_all": torch.from_numpy(chain_encoding_all + 1)
+            .int()
+            .contiguous(),
             "mask": mask,
             "residue_idx": residue_idx.int().contiguous(),
         }
@@ -911,7 +972,9 @@ def fetch_assembly_atoms_df(
         entry_id = normalize_entry(assembly_key)
         chain_map = _fetch_chain_to_uniprot_map_rcsb(entry_id)
         if chains is None:
-            chains = list(chain_map.keys())  # Making sure that we are only saving chains that are in the assembly
+            chains = list(
+                chain_map.keys()
+            )  # Making sure that we are only saving chains that are in the assembly
 
         cif_string = download_assembly_cif(assembly_key)
         st = _read_structure_from_text(cif_string, fmt="cif")
@@ -925,7 +988,9 @@ def fetch_assembly_atoms_df(
         )
 
         # Getting the representative model if available
-        rep = block.find_value('_pdbx_nmr_representative.conformer_id')  # string or None
+        rep = block.find_value(
+            "_pdbx_nmr_representative.conformer_id"
+        )  # string or None
         model_idx = int(rep) - 1 if rep and rep.isdigit() else 0
         df = df.loc[df["model"] == model_idx].copy()
         df = df.reset_index(drop=True)
@@ -990,7 +1055,9 @@ def fetch_assemblies_atoms_parallel(
                 out["df"].to_parquet(parquet_path, index=False)
                 out["parquet_path"] = parquet_path
             if safetensors_dir is not None:
-                st_path = _write_assemblies_safetensors(out["df"], safetensors_dir, code, metadata=out["metadata"])
+                st_path = _write_assemblies_safetensors(
+                    out["df"], safetensors_dir, code, metadata=out["metadata"]
+                )
                 out["safetensors_path"] = st_path
             # include df only if not saving to reduce memory
             if parquet_dir is not None and safetensors_dir is not None:
@@ -1014,10 +1081,7 @@ def fetch_assemblies_atoms_parallel(
 class IntactDataController:
     url = "https://ftp.ebi.ac.uk/pub/databases/intact/current/various/mutations.tsv"
 
-    def __init__(
-        self,
-        output_dir: str | None = None
-    ):
+    def __init__(self, output_dir: str | None = None):
         self.output_dir = output_dir
         self.df_raw: pd.DataFrame = pd.DataFrame()  # Raw input data
         self.df: pd.DataFrame = pd.DataFrame()  # Processed data
@@ -1033,12 +1097,15 @@ class IntactDataController:
             self.df_raw = pd.read_csv(
                 self.url,
                 sep="\t",
-                on_bad_lines='warn',
+                on_bad_lines="warn",
                 engine="python",
             )
 
             if self.output_dir is not None:
-                self.df_raw.to_parquet(os.path.join(self.output_dir, "df_intact_mutations_raw.parquet"), index=False)
+                self.df_raw.to_parquet(
+                    os.path.join(self.output_dir, "df_intact_mutations_raw.parquet"),
+                    index=False,
+                )
         except Exception as e:
             logger.error(f"Error downloading IntAct Mutations raw data: {e}")
 
@@ -1050,14 +1117,10 @@ class IntactDataController:
         logger.info("Processing IntAct Mutations raw data")
 
         # Regular expression to extract UniProtKB accession numbers
-        uniprot_regex = r'(\buniprotkb:[^()]+)(?=\()'
+        uniprot_regex = r"(\buniprotkb:[^()]+)(?=\()"
 
         # Columns to drop
-        cols_drop = [
-            "PubMedID",
-            "Figure legend",
-            "Interaction AC"
-        ]
+        cols_drop = ["PubMedID", "Figure legend", "Interaction AC"]
 
         # Columns to keep
         cols_features = [
@@ -1066,7 +1129,7 @@ class IntactDataController:
             "Feature range(s)",
             "Original sequence",
             "Resulting sequence",
-            "Interaction participants"
+            "Interaction participants",
         ]
 
         cols_features_dict = {
@@ -1077,45 +1140,34 @@ class IntactDataController:
         df_raw = self.df_raw.copy()
 
         # Removing unused columns
-        df_raw = df_raw.drop(
-            columns=cols_drop
-        )
+        df_raw = df_raw.drop(columns=cols_drop)
 
         # Splitting 'Interaction participants' column into individual rows
-        df = df_raw['Interaction participants'].str.split("|").explode().to_frame("participant")
-        df["participant_protein"] = (
-            df["participant"]
-            .str.extract(uniprot_regex)
+        df = (
+            df_raw["Interaction participants"]
+            .str.split("|")
+            .explode()
+            .to_frame("participant")
         )
-        df["unique_count"] = df['participant_protein'].groupby(df.index).transform("nunique")
+        df["participant_protein"] = df["participant"].str.extract(uniprot_regex)
+        df["unique_count"] = (
+            df["participant_protein"].groupby(df.index).transform("nunique")
+        )
 
         # Adding feature columns
-        df = df.join(
-            df_raw[cols_features].rename(
-                columns=cols_features_dict
-            )
-        )
+        df = df.join(df_raw[cols_features].rename(columns=cols_features_dict))
         df.index.name = "group_id"
 
         # Removing non-unitprod IDs: intact, chebi, etc.
-        df = df.dropna(
-            subset=["participant_protein", "affected_protein_ac"],
-            how="any"
-        )
-        df = df.loc[
-            ~df["participant_protein"].isna(),
-        ]
-        df = df.loc[
-            df["affected_protein_ac"].str.contains("uniprot")
-        ]
-        df = df.loc[
-            df["participant_protein"].str.contains("uniprot")
-        ]
+        df = df.dropna(subset=["participant_protein", "affected_protein_ac"], how="any")
+        df = df.loc[~df["participant_protein"].isna(),]
+        df = df.loc[df["affected_protein_ac"].str.contains("uniprot")]
+        df = df.loc[df["participant_protein"].str.contains("uniprot")]
 
         df = df.loc[
             ~(
-                (df["unique_count"] > 1) &
-                (df["participant_protein"] == df["affected_protein_ac"])
+                (df["unique_count"] > 1)
+                & (df["participant_protein"] == df["affected_protein_ac"])
             )
         ]
 
@@ -1125,7 +1177,7 @@ class IntactDataController:
                 "affected_protein_ac",
                 "feature_ranges",
                 "original_sequence",
-                "resulting_sequence"
+                "resulting_sequence",
             ]
         )
 
@@ -1137,8 +1189,12 @@ class IntactDataController:
         df["resulting_sequence"] = df["resulting_sequence"].fillna("")
 
         # Extracting start and end positions of mutations
-        df["feature_ranges_start"] = df["feature_ranges"].str.split("-").str[0].astype(int)
-        df["feature_ranges_end"] = df["feature_ranges"].str.split("-").str[-1].astype(int)
+        df["feature_ranges_start"] = (
+            df["feature_ranges"].str.split("-").str[0].astype(int)
+        )
+        df["feature_ranges_end"] = (
+            df["feature_ranges"].str.split("-").str[-1].astype(int)
+        )
         df["feature_ranges_start"] -= 1  # Index is 1-based
 
         df = df.reset_index()
@@ -1153,38 +1209,44 @@ class IntactDataController:
         logger.info("Adding UniProt sequences to IntAct Mutations data")
 
         # Collecting all UniProt codes
-        uniprot_codes = pd.concat(
-            [
-                self.df["participant_protein"],
-                self.df["affected_protein_ac"]
-            ],
-            ignore_index=True
-        ).unique().tolist()
+        uniprot_codes = (
+            pd.concat(
+                [self.df["participant_protein"], self.df["affected_protein_ac"]],
+                ignore_index=True,
+            )
+            .unique()
+            .tolist()
+        )
 
         # TODO fasta_map is not needed since structures are being obtained from _fetch_alphafold_structure
         fasta_map = fetch_uniprot_sequences(uniprot_codes, batch_size=100)
 
-        self.df["participant_protein_seq"] = self.df["participant_protein"].map(fasta_map)
-        self.df["affected_protein_ac_seq"] = self.df["affected_protein_ac"].map(fasta_map)
+        self.df["participant_protein_seq"] = self.df["participant_protein"].map(
+            fasta_map
+        )
+        self.df["affected_protein_ac_seq"] = self.df["affected_protein_ac"].map(
+            fasta_map
+        )
 
         self.df = self.df.dropna(
             subset=["participant_protein_seq", "affected_protein_ac_seq"],
             how="any",
-            ignore_index=True
+            ignore_index=True,
         )
 
         # Creating the mutation sequence by replacing the original sequence with the resulting sequence; note that
         # SEQUENCE_DELETION ('.') in the replacement sequence indicates a deletion
-        self.df["affected_protein_ac_seq_mut"] = (
-            self.df.apply(
-                lambda x: (
-                    x["affected_protein_ac_seq"][:x["feature_ranges_start"]] +
-                    x["resulting_sequence"] +
-                    x["affected_protein_ac_seq"][x["feature_ranges_end"]:]
-                ).replace(SEQUENCE_DELETION, ""),
-                axis=1
-            )
+        self.df["affected_protein_ac_seq_mut"] = self.df.apply(
+            lambda x: (
+                x["affected_protein_ac_seq"][: x["feature_ranges_start"]]
+                + x["resulting_sequence"]
+                + x["affected_protein_ac_seq"][x["feature_ranges_end"] :]
+            ).replace(SEQUENCE_DELETION, ""),
+            axis=1,
         )
 
         if self.output_dir is not None:
-            self.df.to_parquet(os.path.join(self.output_dir, "df_intact_mutations.parquet"), index=False)
+            self.df.to_parquet(
+                os.path.join(self.output_dir, "df_intact_mutations.parquet"),
+                index=False,
+            )

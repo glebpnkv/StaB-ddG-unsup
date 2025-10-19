@@ -8,7 +8,7 @@ from tqdm import tqdm
 from stabddg.model import StaBddG
 from stabddg.mpnn_utils import ProteinMPNN
 from stabddg.ppi_dataset import SKEMPIDataset
-from stabddg.utils import extract_chains
+from stabddg.utils.pdb import extract_chains
 
 
 def run(model, dataset, ensemble=20, batch_size=10000):
