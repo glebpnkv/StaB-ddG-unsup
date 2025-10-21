@@ -7,10 +7,14 @@ import torch
 from safetensors import safe_open
 from torch.utils.data import Dataset
 
-from constants import AA3_TO_1, ALPHABET, SEQUENCE_DELETION
+from stabddg.constants import AA3_TO_1, ALPHABET, SEQUENCE_DELETION
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def intact_collate_fn(x):
+    return x[0]
 
 
 class IntactDataset(Dataset):

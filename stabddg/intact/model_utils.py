@@ -1,7 +1,7 @@
 import torch
 
-from model import StaBddG
-from mpnn_utils import ProteinMPNN
+from stabddg.model import StaBddG
+from stabddg.mpnn_utils import ProteinMPNN
 
 
 def _mpnn_forward_from_dict(
@@ -82,8 +82,7 @@ def _mpnn_forward_from_dict(
     )
 
     del X, mask, chain_M, residue_idx, chain_encoding_all
-    import gc as _gc
-    _gc.collect()
+
     return log_probs
 
 
@@ -115,8 +114,6 @@ def folding_dG_from_dict(
     dG = torch.sum(seq_oh * log_probs, dim=(1, 2))
 
     del log_probs, seq_oh
-    import gc as _gc
-    _gc.collect()
 
     return dG
 
@@ -202,8 +199,6 @@ def folding_ddG_from_dict(
 
     # Explicitly freeing up memory
     del X, S, mask, chain_M, residue_idx, chain_encoding_all, decoding_order, backbone_noise, wt_seq, mut_seqs
-    import gc as _gc
-    _gc.collect()
 
     return mut_dG - wt_dG
 
@@ -254,8 +249,6 @@ def binding_ddG_from_intact_datapoint(
 
     # Explicitly freeing up memory
     del complex_dict, binder1_dict, binder2_dict, complex_mut, binder1_mut, binder2_mut
-    import gc as _gc
-    _gc.collect()
 
     return ddG_complex - (ddG_b1 + ddG_b2)
 

@@ -27,7 +27,7 @@ from stabddg.constants import (
     SEQUENCE_DELETION,
     SEQUENCE_UNKNOWN,
 )
-from intact.uniprot import fetch_uniprot_sequences
+from stabddg.intact.uniprot import fetch_uniprot_sequences
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
