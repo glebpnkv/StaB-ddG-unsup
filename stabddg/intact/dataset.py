@@ -1,19 +1,80 @@
 import logging
 import os
+import random
+import time
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from safetensors import safe_open
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from stabddg.constants import AA3_TO_1, ALPHABET, SEQUENCE_DELETION
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+OUTPUT_DICT_KEYS = [
+    "complex",
+    "binder1",
+    "binder2",
+]
+
+INTERNAL_TENSOR_KEYS = [
+    "S",
+    "X",
+    "chain_encoding_all",
+    "mask",
+    "residue_idx",
+    "resnums",
+    "mut_seqs"
+]
+
+
+def pad_or_trim_dim1(t: torch.Tensor, target_len: int) -> torch.Tensor:
+    cur = t.size(1)
+    if cur == target_len:
+        return t
+    if cur > target_len:
+        return t.narrow(1, 0, target_len)
+    pad_right = target_len - cur
+    pads = []
+    # Build (last->first) pairs; only dim=1 gets right pad
+    for d in range(t.dim() - 1, -1, -1):
+        if d == 1:
+            pads.extend([0, pad_right])
+        else:
+            pads.extend([0, 0])
+    return F.pad(t, tuple(pads))
+
 
 def intact_collate_fn(x):
+    out = {}
+
+    # Combining "anchor_idx" and "sign" into a single tensor
+    out["anchor_idx"] = torch.stack([it["anchor_idx"] for it in x])
+    out["sign"] = torch.stack([it["sign"] for it in x])
+
+    # Concatenating remaining sequences
+    for k_dict in OUTPUT_DICT_KEYS:
+        # Getting the max length
+        max_length = max([d[k_dict]["max_length"] for d in x])
+
+        out[k_dict] = {
+            k: torch.cat([
+                pad_or_trim_dim1(m, max_length)
+                for m in (it[k_dict][k] for it in x)
+            ])
+            for k in INTERNAL_TENSOR_KEYS
+        } | {
+            "max_length": max_length
+        }
+
+    return out
+
+
+def passthrough_collate_fn(x):
     return x[0]
 
 
@@ -46,15 +107,14 @@ class IntactDataset(Dataset):
         assemblies_dir,
         max_length: int = 1024,
         k_neutral: int = 32,
-        k_same: int = 4,
-        k_opp: int = 4,
+        k_pos: int = 4,
+        k_neg: int = 4,
     ):
         self.proteins_dir = proteins_dir
         self.assemblies_dir = assemblies_dir
-        self.max_length = max_length
         self.k_neutral = k_neutral
-        self.k_same = k_same
-        self.k_opp = k_opp
+        self.k_pos = k_pos
+        self.k_neg = k_neg
 
         # Reading the metadata dataframe
         df = pd.read_parquet(df_intact_path)
@@ -67,18 +127,24 @@ class IntactDataset(Dataset):
 
         len_filtered = len(df)
 
-        logger.info(f"Removed {len_raw - len_filtered} rows out of {len_raw} with sequence length > {max_length}")
+        logger.info(
+            f"Kept {len_filtered} rows out of {len_raw} with sequence length > {max_length} ("
+            f"{len_raw - len_filtered} rows were removed)"
+        )
 
         # Separating intact data into +ve, -ve and neutrals
         self.df_pos = df.loc[
             df["feature_type"].isin(self.feature_type_pos)
         ].copy()
+        self.df_pos["sign"] = 1
         self.df_neg = df.loc[
             df["feature_type"].isin(self.feature_type_neg)
         ].copy()
+        self.df_neg["sign"] = -1
         self.df_neutral = df.loc[
             df["feature_type"].isin(self.feature_type_neutral)
         ].copy()
+        self.df_neutral["sign"] = 0
         self.df = pd.concat([self.df_pos, self.df_neg, self.df_neutral])
 
         # Making an index of datapoints for sampling
@@ -236,12 +302,11 @@ class IntactDataset(Dataset):
         cmplex = self._load_assembly(name_complex)
         # Making a mutation sequence
         complex_mut_seqs = self._make_mutation_sequence(cmplex, sample)
+        # Getting the length
+        max_length = cmplex["data"]["S"].shape[0]
 
         # Preparing output
-        out = {
-            "complex": cmplex["data"],
-            "complex_mut_seqs": complex_mut_seqs,
-        }
+        out = cmplex["data"] | {"mut_seqs": complex_mut_seqs, "max_length": max_length}
 
         return out
 
@@ -322,11 +387,16 @@ class IntactDataset(Dataset):
             sample=sample
         )
 
+        # Getting the length
+        binder1_max_length = binder1.get("S").shape[0]
+        binder2_max_length = binder2_mut_seqs.shape[0]
+
+        out_binder1 = binder1 | {"mut_seqs": binder1.get("S"), "max_length": binder1_max_length}
+        out_binder2 = binder2 | {"mut_seqs": binder2_mut_seqs, "max_length": binder2_max_length}
+
         out = {
-            "binder1": binder1,
-            "binder2": binder2,
-            "binder1_mut_seqs": binder1.get("S"),
-            "binder2_mut_seqs": binder2_mut_seqs,
+            "binder1": out_binder1,
+            "binder2": out_binder2
         }
 
         return out
@@ -336,18 +406,19 @@ class IntactDataset(Dataset):
         # out_binders = self._fetch_binders_full(idx)
         out_binders = self._fetch_binders(idx)
 
-        out = out_complex | out_binders
+        out = {"complex": out_complex} | out_binders
         return out
 
-    def _combine_items(self, items: list[dict], add_mask: bool = True):
+    @staticmethod
+    def _combine_items(
+        items: list[dict]
+    ):
         """
         Batch and pad a list of fetched items.
-        Each item is a dict with 6 keys total:
-          - 3 keys with 1D arrays (L,) representing sequences/labels
-          - 3 keys with dict values; each dict maps str -> array with first dim L (or L')
+        Each item is a dict with 3 keys total:
+          - 3 keys with dict values; each dict maps str -> array with first dim L.
         Output preserves the same top-level keys as _fetch returns.
-        For the 1D-array keys: output tensors of shape [B, self.max_length]
-        For the dict keys: output dicts with tensors of shape [B, self.max_length, ...]
+        Output dicts with tensors of shape [B, max_length, ...]
         All outputs are torch.Tensors. Padding/truncation follows the current padding semantics.
         """
         def pad_stack_first_dim(arr_list: list[np.ndarray], target_len: int) -> np.ndarray:
@@ -364,66 +435,23 @@ class IntactDataset(Dataset):
                 stacked.append(a_padded)
             return np.stack(stacked, axis=0)
 
-        def make_mask_from_first_dim(arr_list: list[np.ndarray], target_len: int) -> np.ndarray:
-            # Builds [B, target_len] mask with 1.0 for valid positions based on original lengths
-            B = len(arr_list)
-            mask = np.zeros((B, target_len), dtype=np.float32)
-            for i, a in enumerate(arr_list):
-                l = min(int(a.shape[0]), target_len)
-                mask[i, :l] = 1.0
-            return mask
+        out: dict[str, dict | int] = {}
 
-        # Determine which top-level keys are arrays and which are dicts using the first item
-        example = items[0]
-        top_level_keys = list(example.keys())
-
-        # Identify array-like (1D L) keys and dict-like keys
-        array_keys = [k for k in top_level_keys if isinstance(example[k], np.ndarray)]
-        dict_keys = [k for k in top_level_keys if isinstance(example[k], dict)]
-
-        out: dict[str, torch.Tensor | dict] = {}
-
-        # Process array-like keys (expect (L,) arrays); output [B, max_length] long tensors
-        for k in array_keys:
-            arr_list = [it[k] for it in items]
-            stacked_np = pad_stack_first_dim(arr_list, self.max_length)
-            # Default to int64 for sequences; if not integer dtype, cast to float32
-            if np.issubdtype(stacked_np.dtype, np.integer):
-                out[k] = torch.from_numpy(stacked_np.astype(np.int64))
-            else:
-                out[k] = torch.from_numpy(stacked_np.astype(np.float32))
-
-        # Optional global mask: choose one representative array source for lengths if available,
-        # otherwise try from first dict key's first inner array.
-        if add_mask:
-            mask_source_list: list[np.ndarray] | None = None
-            if array_keys:
-                mask_source_list = [it[array_keys[0]] for it in items]
-            elif dict_keys:
-                first_dict_key = dict_keys[0]
-                inner_keys = list(example[first_dict_key].keys())
-                if inner_keys:
-                    mask_source_list = [it[first_dict_key][inner_keys[0]] for it in items]
-            if mask_source_list is not None:
-                out["mask"] = torch.from_numpy(make_mask_from_first_dim(mask_source_list, self.max_length))
-
-        # Process dict-like keys: preserve subkeys; pad/stack along first dim
-        for k in dict_keys:
-            inner_example = example[k]
-            inner_keys = list(inner_example.keys())
-            out_inner: dict[str, torch.Tensor] = {}
-            for subk in inner_keys:
-                arr_list = [it[k][subk] for it in items]
-                stacked_np = pad_stack_first_dim(arr_list, self.max_length)
-                # Numeric dtype handling
-                if np.issubdtype(stacked_np.dtype, np.floating):
-                    out_inner[subk] = torch.from_numpy(stacked_np.astype(np.float32))
-                elif np.issubdtype(stacked_np.dtype, np.integer):
-                    out_inner[subk] = torch.from_numpy(stacked_np.astype(np.int64))
-                else:
-                    # Fallback: try float32
-                    out_inner[subk] = torch.from_numpy(stacked_np.astype(np.float32))
-            out[k] = out_inner
+        # Process dict-like keys: pad/stack along first dim
+        for k_dict in OUTPUT_DICT_KEYS:
+            # Getting the max length
+            max_length = max([d[k_dict]["max_length"] for d in items])
+            out[k_dict] = {
+                k: torch.from_numpy(
+                    pad_stack_first_dim(
+                        [m for m in (it[k_dict][k] for it in items)],
+                        max_length
+                    )
+                )
+                for k in INTERNAL_TENSOR_KEYS
+            } | {
+                "max_length": max_length
+            }
 
         return out
 
@@ -431,48 +459,97 @@ class IntactDataset(Dataset):
         # Getting the absolute index from the relative index
         cur_idx_row = self.df_idx.iloc[[idx]]
         idx = cur_idx_row.index[0]
-        # Getting the "sign" of the anchor datapoint (idx)
-        sign = cur_idx_row.values[0]
 
-        sign_same = self.feature_type_pos if sign in self.feature_type_pos else self.feature_type_neg
-        sign_diff = self.feature_type_neg if sign in self.feature_type_pos else self.feature_type_pos
-
-        sample_same = self.df.loc[
-            self.df["feature_type"].isin(sign_same)
-        ].sample(self.k_same).index
-
-        sample_opp = self.df.loc[
-            self.df["feature_type"].isin(sign_diff)
-        ].sample(self.k_opp).index
-
-        sample_neutral = self.df.loc[
-            self.df["feature_type"].isin(self.feature_type_neutral)
-        ].sample(self.k_neutral).index
+        sign = self.df.loc[idx, "sign"]
 
         # Getting the datapoint itself (anchor)
-        out_anchor = self._combine_items(
-            [self._fetch(idx)]
-        )
-
-        # Getting "same" datapoints
-        out_same = self._combine_items(
-            [self._fetch(x) for x in sample_same]
-        )
-        # Getting "opposite" datapoints
-        out_opp = self._combine_items(
-            [self._fetch(x) for x in sample_opp]
-        )
-        # Getting "neutral" datapoints
-        out_neutral = self._combine_items(
-            [self._fetch(x) for x in sample_neutral]
+        out_data = self._combine_items(
+            items=[self._fetch(idx)]
         )
 
         # Merging all datapoints into a single dictionary
         out = {
-            "anchor": out_anchor,
-            "same": out_same,
-            "opp": out_opp,
-            "neutral": out_neutral,
-        }
+            "anchor_idx": torch.from_numpy(np.array(idx)),
+            "sign": torch.from_numpy(np.array(sign)),
+        } | out_data
 
         return out
+
+    def _sample(self):
+        # Sampling positive values
+        sample_pos = self.df.loc[
+            self.df["feature_type"].isin(self.feature_type_pos)
+        ].sample(
+            self.k_pos,
+            replace=True  # Safety
+        ).index
+
+        sample_neg = self.df.loc[
+            self.df["feature_type"].isin(self.feature_type_neg)
+        ].sample(
+            self.k_neg,
+            replace=True  # Safety
+        ).index
+
+        sample_neutral = self.df.loc[
+            self.df["feature_type"].isin(self.feature_type_neutral)
+        ].sample(
+            self.k_neutral,
+            replace=True  # Safety
+        ).index
+
+        out_pos = self._combine_items(
+            items=[self._fetch(x) for x in sample_pos]
+        )
+        # Getting "opposite" datapoints
+        out_neg = self._combine_items(
+            items=[self._fetch(x) for x in sample_neg]
+        )
+        # Getting "neutral" datapoints
+        out_neutral = self._combine_items(
+            items=[self._fetch(x) for x in sample_neutral]
+        )
+
+        return out_pos, out_neg, out_neutral
+
+
+class IntactContrastiveStream(IterableDataset):
+    def __init__(
+        self,
+        intact_ds: IntactDataset,
+        steps_per_epoch: int | None = None,
+        seed: int | None = None
+    ):
+        """
+        intact_ds: an initialized IntactDataset (used as a helper/provider)
+        steps_per_epoch: cap number of yielded batches per epoch (optional)
+        seed: base RNG seed for reproducibility (worker-specific seeding applied)
+        """
+        self.ds = intact_ds
+        self.steps_per_epoch = steps_per_epoch
+        self.seed = seed
+
+    def _seed_worker(self, worker_id: int):
+        # Create a distinct seed for each worker to keep streams disjoint but reproducible
+        base = self.seed if self.seed is not None else int(time.time())
+        s = base + worker_id
+        np.random.seed(s)
+        random.seed(s)
+        torch.manual_seed(s)
+
+    def __iter__(self):
+        info = get_worker_info()
+        worker_id = info.id if info is not None else 0
+
+        # Seed per-worker RNGs
+        self._seed_worker(worker_id)
+
+        step = 0
+        while True:
+            # Produce one contrastive batch by calling the existing sampler
+            pos, neg, neutral = self.ds._sample()
+            yield {"positive": pos, "negative": neg, "neutral": neutral}
+
+            step += 1
+            if self.steps_per_epoch is not None and step >= self.steps_per_epoch:
+                break

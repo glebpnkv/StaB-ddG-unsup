@@ -12,6 +12,7 @@ dependencies = [
     "ipywidgets>=8.1.7",
     "pandas==2.3.0",
     "pyarrow>=21.0.0",
+    "pytest>=8.4.2",
     "rcsb-api>=1.4.0",
     "scikit-learn==1.7.0",
     "scipy==1.15.3",
