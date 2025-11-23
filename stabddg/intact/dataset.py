@@ -132,15 +132,16 @@ class IntactDataset(Dataset):
             f"{len_raw - len_filtered} rows were removed)"
         )
 
-        # Separating intact data into +ve, -ve and neutrals
+        # Separating intact data into +ve, -ve and neutrals; +ve impact means negative ddG - hence the sign will
+        # become -ve
         self.df_pos = df.loc[
             df["feature_type"].isin(self.feature_type_pos)
         ].copy()
-        self.df_pos["sign"] = 1
+        self.df_pos["sign"] = -1
         self.df_neg = df.loc[
             df["feature_type"].isin(self.feature_type_neg)
         ].copy()
-        self.df_neg["sign"] = -1
+        self.df_neg["sign"] = 1
         self.df_neutral = df.loc[
             df["feature_type"].isin(self.feature_type_neutral)
         ].copy()
@@ -425,9 +426,9 @@ class IntactDataset(Dataset):
             # Pads/truncates only along the first dimension to target_len, constant=0
             stacked = []
             for a in arr_list:
-                l = min(int(a.shape[0]), target_len)
-                a_cut = a[:l]
-                pad_len = target_len - l
+                orig_len = min(int(a.shape[0]), target_len)
+                a_cut = a[:orig_len]
+                pad_len = target_len - orig_len
                 pad_width = [(0, pad_len)]
                 if a_cut.ndim > 1:
                     pad_width += [(0, 0)] * (a_cut.ndim - 1)

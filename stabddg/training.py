@@ -33,6 +33,6 @@ def _distributed_concat_1d(world_size, t: torch.Tensor) -> torch.Tensor:
     dist.all_gather(gathered, t_padded)
     # trim per rank by its true length and concat
     outs = []
-    for g, l in zip(gathered, lens):
-        outs.append(g[: int(l.item())])
+    for g, cur_len in zip(gathered, lens):
+        outs.append(g[: int(cur_len.item())])
     return torch.cat(outs, dim=0)

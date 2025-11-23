@@ -15,9 +15,9 @@ pdb_dir="$data_dir/AlphaFold_model_PDBs"
 stability_data="$data_dir/Processed_K50_dG_datasets/Tsuboyama2023_Dataset2_Dataset3_20230416.csv"
 
 # Multi-GPU launcher behavior
-#   auto  -> use torchrun if >1 GPU; otherwise plain python
-#   always-> always use torchrun
-#   never -> never use torchrun
+#   auto   -> use torchrun if >1 GPU; otherwise plain python
+#   always -> always use torchrun
+#   never  -> never use torchrun
 use_torchrun="auto"
 # Optionally force number of processes (defaults to GPU count when using torchrun)
 nproc=""

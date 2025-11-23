@@ -16,6 +16,7 @@ from stabddg.model import StaBddG
 from stabddg.training import _is_dist_initialized, _is_main_process, _unwrap_model
 
 torch.set_float32_matmul_precision("high")
+default_amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -54,15 +55,49 @@ class ContrastiveLoss(_Loss):
             z_neg = F.normalize(z_neg, dim=0)
             z_neu = F.normalize(z_neu, dim=0)
 
-        # Calculating cosine similarities
-        s_pos = (z * z_sign) @ z_pos.T / self.tau_pos     # (B, B_pos)
-        s_neg = (z * z_sign) @ z_neg.T / self.tau_neg     # (B, B_neg)
-        s_neu = z @ z_neu.T                               # (B, B_neu)
+        # Concatenating positive and negative samples
+        z_posneg = torch.cat([z_pos, z_neg], dim=0)
+        z_posneg_sign = torch.cat([torch.ones_like(z_pos), -torch.ones_like(z_neg)], dim=0)
 
-        # Per-sample vectors (B,)
-        loss_pos_vec = -torch.mean(s_pos - torch.logsumexp(s_neu, dim=-1, keepdims=True), dim=-1)
-        loss_neg_vec = -torch.mean(-s_neg - torch.logsumexp(-s_neu, dim=-1, keepdims=True), dim=-1)
-        return loss_pos_vec, loss_neg_vec
+        # Weights matrix indicating positive and negative samples
+        w = (z_sign * z_posneg_sign.T)
+        same_mask = (w > 0)
+        opp_mask = (w < 0)
+
+        # Calculating cosine similarities
+        s = (z @ z_posneg.T)         # (B, N)
+        s_pos = s / self.tau_pos     # (B, N)
+        s_neg = s / self.tau_neg     # (B, N)
+
+        # Neutral denominators (mirrored space for the opp term)
+        s_neu = (z @ z_neu.T)  # (B, B_neu)
+        lse_neu_pos = torch.logsumexp(s_neu / self.tau_pos, dim=1, keepdim=True)  # [B, 1]
+        lse_neu_neg = torch.logsumexp(-s_neu / self.tau_neg, dim=1, keepdim=True)  # [B, 1]
+
+        # Counts per anchor
+        pos_count = same_mask.sum(dim=1, keepdim=True)  # [B, 1]
+        neg_count = opp_mask.sum(dim=1, keepdim=True)  # [B, 1]
+
+        # Sums over selected pairs
+        same_mask_f = same_mask.to(s.dtype)
+        opp_mask_f = opp_mask.to(s.dtype)
+        pos_sum = (s_pos * same_mask_f).sum(dim=1, keepdim=True)  # [B, 1]
+        neg_sum = (s_neg * opp_mask_f).sum(dim=1, keepdim=True)  # [B, 1]
+
+        # Safe divisors
+        pos_count_safe = torch.clamp(pos_count, min=1)
+        neg_count_safe = torch.clamp(neg_count, min=1)
+
+        # Averaging: subtract count * LSE, then divide by count
+        # Note that the ddG value for +ve pairs should be negative
+        loss_pos_vec = -(pos_sum - pos_count * lse_neu_pos) / pos_count_safe
+        loss_neg_vec = -(-neg_sum - neg_count * lse_neu_neg) / neg_count_safe
+
+        # Zero-out anchors with no samples of that type
+        loss_pos_vec = loss_pos_vec * (pos_count > 0).to(s.dtype)
+        loss_neg_vec = loss_neg_vec * (neg_count > 0).to(s.dtype)
+
+        return loss_pos_vec.squeeze(1), loss_neg_vec.squeeze(1)
 
     def _reduce(self, x: torch.Tensor) -> torch.Tensor:
         if self.reduction == "mean":
@@ -116,8 +151,9 @@ def train_step(
     optimizer: torch.optim.Optimizer,
     loss_fn: ContrastiveLoss,
     epoch: int,
+    output_logger = logger,
     grad_accum_steps: int = 1,
-    amp_dtype: torch.dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    amp_dtype: torch.dtype = default_amp_dtype
 ) -> tuple[dict[str, float], pd.DataFrame]:
     # Preparing the model and the optimiser for training
     _unwrap_model(model).train()
@@ -171,9 +207,11 @@ def train_step(
         if _is_main_process():
             pbar.set_description(f"Train Batch {i + 1}")
             pbar.set_postfix(metrics)
-            pbar.update(1)
-            logger.info(f'{print_prefix}: Train metrics: '
-                        f'{ {k: "{0:0.4f}".format(v) for k, v in metrics.items() if v is not None} }')
+            # pbar.update(1)
+            output_logger.info(
+                f'{print_prefix}: Batch {i + 1} Train metrics: '
+                f'{ {k: "{0:0.4f}".format(v) for k, v in metrics.items() if v is not None} }'
+            )
 
         if not all_train_metrics:
             all_train_metrics = metrics
@@ -213,7 +251,8 @@ def validation_step(
     loss_fn: ContrastiveLoss,
     epoch: int,
     step_name: str = "Validation",
-    amp_dtype: torch.dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16,
+    output_logger = logger,
+    amp_dtype: torch.dtype = default_amp_dtype,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     _unwrap_model(model).eval()
     print_prefix = f"Epoch {epoch + 1}"
@@ -248,9 +287,11 @@ def validation_step(
                 if isinstance(pbar, tqdm):
                     pbar.set_description(f"{step_name} Batch {i + 1}")
                     pbar.set_postfix(metrics)
-                    pbar.update(1)
-                logger.info(f'{print_prefix}: {step_name} metrics: '
-                            f'{ {k: "{0:0.4f}".format(v) for k, v in metrics.items() if v is not None} }')
+                    # pbar.update(1)
+                output_logger.info(
+                    f'{print_prefix}: Batch {i + 1} {step_name} metrics: '
+                    f'{ {k: "{0:0.4f}".format(v) for k, v in metrics.items() if v is not None} }'
+                )
 
             if not all_metrics:
                 all_metrics = metrics
@@ -287,17 +328,23 @@ def pretrain(
     dataset_train: IntactDataset,
     dataset_valid: IntactDataset,
     dataset_test: IntactDataset,
-    run_name: str,
-    model_save_dir: str,
+    save_dir: str,
+    batch_size: int = 4,
     num_dataloader_workers: int = 1,
     lr: float = 1e-4,
+    normalize_loss: bool = True,
     n_epochs: int = 10,
+    model_val_freq: int = 2,
     model_save_freq: int = 1,
     use_wandb: bool = False,
     grad_accum_steps: int = 1,
 ):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = ContrastiveLoss()
+    loss_fn = ContrastiveLoss(
+        lambda_pos=1.0,
+        lambda_neg=dataset_train.df_pos.shape[0] / dataset_train.df_neg.shape[0],
+        normalize=normalize_loss
+    )
 
     # DataFrame with training, validation and test metrics
     df_metrics = pd.DataFrame()
@@ -305,22 +352,27 @@ def pretrain(
     df_forecasts = pd.DataFrame()
 
     # Directory to save model checkpoints
-    if _is_main_process() and not os.path.exists(model_save_dir):
-        logger.info(f"Creating directory {model_save_dir}")
+    model_save_dir = os.path.join(save_dir, "model")
+    metrics_save_dir = os.path.join(save_dir, "metrics")
+    if _is_main_process():
+        logger.info(f"Creating directory {save_dir}")
+
+        os.makedirs(save_dir, exist_ok=True)
         os.makedirs(model_save_dir, exist_ok=True)
+        os.makedirs(metrics_save_dir, exist_ok=True)
 
     # Creating a logging file logs.txt (main process only)
     if _is_main_process():
-        log_path = os.path.join(model_save_dir, "logs.txt")
+        log_path = os.path.join(save_dir, "logs.txt")
         file_handler = logging.FileHandler(log_path, mode="w")
         file_handler.setLevel(logging.INFO)
         file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-        logger.addHandler(file_handler)
-        logger.info(f"Logging to {log_path}")
+        logger_file = logging.getLogger("file_only")
+        logger_file.setLevel(logging.INFO)
+        logger_file.propagate = False
+        logger_file.addHandler(file_handler)
 
-    # DDP state
-    world_size = dist.get_world_size() if _is_dist_initialized() else 1
-    rank = dist.get_rank() if _is_dist_initialized() else 0
+        logger.info(f"Logging to {log_path}")
 
     # Preparing data loaders (batch_size fixed to 1, use a collate_fn that returns the single element)
     train_sampler = DistributedSampler(dataset_train, shuffle=True) if _is_dist_initialized() else None
@@ -331,7 +383,7 @@ def pretrain(
 
     dl_train = DataLoader(
         dataset_train,
-        batch_size=1,
+        batch_size=batch_size,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=num_dataloader_workers,
@@ -340,7 +392,7 @@ def pretrain(
     )
     dl_valid = DataLoader(
         dataset_valid,
-        batch_size=1,
+        batch_size=batch_size,
         shuffle=False,
         sampler=valid_sampler,
         num_workers=num_dataloader_workers,
@@ -349,7 +401,7 @@ def pretrain(
     )
     dl_test = DataLoader(
         dataset_test,
-        batch_size=1,
+        batch_size=batch_size,
         shuffle=False,
         sampler=test_sampler,
         num_workers=num_dataloader_workers,
@@ -366,6 +418,14 @@ def pretrain(
         persistent_workers=True
     )
 
+    # Saving the initial model checkpoint
+    if _is_main_process():
+        logger.info("Saving model checkpoint at epoch 0")
+        torch.save(
+            _unwrap_model(model).pmpnn.state_dict(),
+            f"{model_save_dir}/initial.pt"
+        )
+
     # Iterating over epochs
     for epoch in tqdm(range(n_epochs), desc="Epoch"):
         # Running training step
@@ -377,10 +437,16 @@ def pretrain(
             loss_fn=loss_fn,
             epoch=epoch,
             grad_accum_steps=grad_accum_steps,
+            output_logger=logger_file,
         )
 
         # Collecting metrics from the training step
         if _is_main_process():
+            logger.info(
+                f'Epoch {epoch + 1}: Train metrics: '
+                f'{ {k: "{0:0.4f}".format(v) for k, v in train_metrics.items() if v is not None} }'
+            )
+
             df_train_metrics = pd.DataFrame(
                 {"epoch": epoch + 1, "split": "Train"} | train_metrics,
                 index=[0]
@@ -393,52 +459,73 @@ def pretrain(
                 logger.info(f"Saving model checkpoint at epoch {epoch + 1}")
                 torch.save(
                     _unwrap_model(model).pmpnn.state_dict(),
-                    f"{model_save_dir}/{run_name}_epoch{epoch}.pt",
+                    f"{model_save_dir}/epoch_{epoch + 1}.pt",
                 )
 
-        # Running validation and test steps across all ranks
-        valid_metrics, df_forecasts_valid = validation_step(
-            model=model,
-            dataloader=dl_valid,
-            dataloader_contrastive=dl_contrastive,
-            loss_fn=loss_fn,
-            epoch=epoch,
-            step_name="Validation"
-        )
-        test_metrics, df_forecasts_test = validation_step(
-            model=model,
-            dataloader=dl_test,
-            dataloader_contrastive=dl_contrastive,
-            loss_fn=loss_fn,
-            epoch=epoch,
-            step_name="Test"
-        )
+        # Running validation steps across all ranks
+        if (epoch + 1) % model_val_freq == 0:
+            valid_metrics, df_forecasts_valid = validation_step(
+                model=model,
+                dataloader=dl_valid,
+                dataloader_contrastive=dl_contrastive,
+                loss_fn=loss_fn,
+                epoch=epoch,
+                output_logger=logger_file,
+                step_name="Validation",
+            )
 
+            if _is_main_process():
+                logger.info(
+                    f'Epoch {epoch + 1}: Validation metrics: '
+                    f'{ {k: "{0:0.4f}".format(v) for k, v in valid_metrics.items() if v is not None} }'
+                )
+
+                df_valid_metrics = pd.DataFrame(
+                    {"epoch": epoch + 1, "split": "Validation"} | valid_metrics,
+                    index=[0]
+                )
+                df_metrics = pd.concat([df_metrics, df_valid_metrics], ignore_index=True)
+                df_forecasts = pd.concat([df_forecasts, df_forecasts_valid], ignore_index=True)
+
+        # Save metrics and forecasts as CSV
         if _is_main_process():
-            df_valid_metrics = pd.DataFrame(
-                {"epoch": epoch + 1, "split": "Validation"} | valid_metrics,
-                index=[0]
-            )
-            df_test_metrics = pd.DataFrame(
-                {"epoch": epoch + 1, "split": "Test"} | test_metrics,
-                index=[0]
-            )
-            df_metrics = pd.concat([df_metrics, df_valid_metrics, df_test_metrics], ignore_index=True)
-            df_forecasts = pd.concat([df_forecasts, df_forecasts_valid, df_forecasts_test], ignore_index=True)
-
-            # Save metrics and forecasts as CSV
-            df_metrics.to_csv(os.path.join(model_save_dir, "metrics.csv"), index=False)
-            df_forecasts.to_csv(os.path.join(model_save_dir, "forecasts.csv"), index=False)
+            df_metrics.to_csv(os.path.join(metrics_save_dir, "metrics.csv"), index=False)
+            df_forecasts.to_csv(os.path.join(metrics_save_dir, "forecasts.csv"), index=False)
 
             if use_wandb:
                 wandb.log(valid_metrics, step=epoch + 1)
-                wandb.log(test_metrics, step=epoch + 1)
                 wandb.log({"lr": optimizer.param_groups[0]["lr"],}, step=epoch + 1)
-        
+
+    # Calculating the test metrics at the end of the training loop
+    logger.info("Calculating test metrics at the end of the training loop")
+    test_metrics, df_forecasts_test = validation_step(
+        model=model,
+        dataloader=dl_test,
+        dataloader_contrastive=dl_contrastive,
+        loss_fn=loss_fn,
+        epoch=n_epochs,
+        step_name="Test",
+        output_logger=logger_file,
+    )
+
+    if _is_main_process():
+        logger.info(
+            f'Epoch {epoch + 1}: Test metrics: '
+            f'{ {k: "{0:0.4f}".format(v) for k, v in test_metrics.items() if v is not None} }'
+        )
+
+        df_test_metrics = pd.DataFrame(
+            {"epoch": n_epochs, "split": "Test"} | test_metrics,
+            index=[0]
+        )
+        df_metrics = pd.concat([df_metrics, df_test_metrics], ignore_index=True)
+        df_forecasts = pd.concat([df_forecasts, df_forecasts_test], ignore_index=True)
+
+        df_metrics.to_csv(os.path.join(metrics_save_dir, "metrics.csv"), index=False)
+        df_forecasts.to_csv(os.path.join(metrics_save_dir, "forecasts.csv"), index=False)
+
     # Saving the final model checkpoint
     if _is_main_process():
-        if not os.path.exists(model_save_dir):
-            os.makedirs(model_save_dir)
         torch.save(
-            _unwrap_model(model).pmpnn.state_dict(), f"{model_save_dir}/{run_name}_final.pt"
+            _unwrap_model(model).pmpnn.state_dict(), f"{model_save_dir}/final.pt"
         )
