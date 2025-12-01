@@ -8,9 +8,6 @@ dependencies = [
     "accelerate>=1.10.1",
     "biopython==1.85",
     "gemmi>=0.7.3",
-    "google-cloud-aiplatform>=1.128.0",
-    "google-cloud-pipeline-components>=2.22.0",
-    "google-cloud-storage>=3.4.1",
     "kfp>=2.14.6",
     "matplotlib>=3.10.7",
     "pandas==2.3.0",
@@ -19,7 +16,6 @@ dependencies = [
     "scikit-learn==1.7.0",
     "scipy==1.15.3",
     "seaborn>=0.13.2",
-    "torch==2.6.0",
     "tqdm==4.67.1",
     "wandb==0.20.1",
 ]
@@ -31,3 +27,48 @@ dev = [
     "pytest>=8.4.2",
     "ruff>=0.12.8",
 ]
+
+[build-system]
+requires = ["uv_build>=0.9.13,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "stabddg"
+module-root = ""
+
+[project.optional-dependencies]
+gcp = [
+    "google-cloud-aiplatform>=1.128.0",
+    "google-cloud-pipeline-components>=2.22.0",
+    "google-cloud-storage>=3.4.1",
+]
+pytorch_cpu = [
+  "torch>=2.6.0",
+]
+pytorch_cuda = [
+  "torch>=2.6.0",
+]
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "pytorch_cpu" },
+    { extra = "pytorch_cuda" },
+  ],
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", extra = "pytorch_cpu" },
+  { index = "pytorch-cu128", extra = "pytorch_cuda" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

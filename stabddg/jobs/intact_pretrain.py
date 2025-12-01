@@ -205,8 +205,6 @@ def intact_pretrain(
         k_neg=k_neg,
     )
 
-    # ds_contrastive = IntactContrastiveStream(ds_train)
-
     # Setting up the model
     pmpnn = ProteinMPNN(
         node_features=128,

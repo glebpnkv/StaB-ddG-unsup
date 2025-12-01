@@ -8,8 +8,6 @@ run_name="intact-pretrain"
 
 # GCS locations (if empty, no GCS copy is attempted)
 intact_data_gcs_uri=""
-#proteins_gcs_uri=""
-#assemblies_gcs_uri=""
 model_ckpt_gcs_uri=""
 model_save_gcs_uri=""
 
@@ -70,8 +68,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --run_name)                 run_name="${2:-$run_name}"; shift 2 ;;
     --intact_data_gcs_uri)      intact_data_gcs_uri="${2:-}"; shift 2 ;;
-#    --proteins_gcs_uri)         proteins_gcs_uri="${2:-}"; shift 2 ;;
-#    --assemblies_gcs_uri)       assemblies_gcs_uri="${2:-}"; shift 2 ;;
     --model_ckpt_gcs_uri)       model_ckpt_gcs_uri="${2:-}"; shift 2 ;;
     --model_save_gcs_uri)       model_save_gcs_uri="${2:-}"; shift 2 ;;
     --local_root)               local_root="${2:-$local_root}"; shift 2 ;;
@@ -125,29 +121,13 @@ mkdir -p "${local_data_dir}" \
 # -------- GCS → local copies (if URIs provided) --------
 if [[ -n "${intact_data_gcs_uri}" ]]; then
   echo "[INFO] Copying IntAct parquet + metadata from GCS..."
-  # gsutil -m cp -r "${intact_data_gcs_uri%/}/"* "${local_data_dir}/"
   python "${transfer_script}" download "${intact_data_gcs_uri}" "${local_data_dir}/"
 else
   echo "[INFO] intact_data_gcs_uri not set; assuming data already present at ${local_data_dir}"
 fi
 
-#if [[ -n "${proteins_gcs_uri}" ]]; then
-#  echo "[INFO] Copying proteins tensors from GCS..."
-#  gsutil -m cp -r "${proteins_gcs_uri%/}/"* "${local_proteins_dir}/" || echo "[WARN] No proteins to copy"
-#else
-#  echo "[INFO] proteins_gcs_uri not set; assuming proteins already present at ${local_proteins_dir}"
-#fi
-
-#if [[ -n "${assemblies_gcs_uri}" ]]; then
-#  echo "[INFO] Copying assemblies tensors from GCS..."
-#  gsutil -m cp -r "${assemblies_gcs_uri%/}/"* "${local_assemblies_dir}/" || echo "[WARN] No assemblies to copy"
-#else
-#  echo "[INFO] assemblies_gcs_uri not set; assuming assemblies already present at ${local_assemblies_dir}"
-#fi
-
 if [[ -n "${model_ckpt_gcs_uri}" ]]; then
   echo "[INFO] Copying existing model checkpoints from GCS..."
-  # gsutil -m cp -r "${model_ckpt_gcs_uri%/}/"* "${local_ckpt_dir}/" || echo "[WARN] No ckpts to copy"
   python "${transfer_script}" download "${model_ckpt_gcs_uri}" "${local_ckpt_dir}/" || echo "[WARN] No ckpts to copy"
 fi
 
@@ -210,10 +190,6 @@ PY
 
 NUM_GPUS="$(gpu_count)"
 echo "[INFO] Detected GPUs: ${NUM_GPUS}"
-#if [[ "${NUM_GPUS}" -lt 1 ]]; then
-#  echo "[ERROR] No GPUs visible."
-#  exit 1
-#fi
 
 # Decide whether to use torchrun and what nproc_per_node to use
 should_use_torchrun=false
@@ -299,24 +275,8 @@ echo "[INFO] Training completed."
 if [[ -n "${model_save_gcs_uri}" ]]; then
   echo "[INFO] Copying artifacts from ${local_model_save_dir} to ${model_save_gcs_uri}"
   python "${transfer_script}" upload "${local_model_save_dir}" "${model_save_gcs_uri%/}"
-  # gsutil -m cp -r "${local_model_save_dir}" "${model_save_gcs_uri%/}"
 else
   echo "[INFO] model_save_gcs_uri not set; skipping upload of artifacts."
 fi
-
-# -------- Populate Vertex artifact outputs, if paths provided --------
-#if [[ -n "${model_save_gcs_uri}" ]]; then
-#  MODEL_ARTIFACT_PATH="${model_save_gcs_uri%/}/${local_model_subdir}/model"
-#  METRICS_ARTIFACT_PATH="${model_save_gcs_uri%/}/${local_model_subdir}/metrics"
-#
-#  if [[ -n "${vertex_model_dir_path}" ]]; then
-#    echo "[INFO] Writing model artifact URI to ${vertex_model_dir_path}"
-#    echo "${MODEL_ARTIFACT_PATH}" > "${vertex_model_dir_path}"
-#  fi
-#  if [[ -n "${vertex_metrics_dir_path}" ]]; then
-#    echo "[INFO] Writing metrics artifact URI to ${vertex_metrics_dir_path}"
-#    echo "${METRICS_ARTIFACT_PATH}" > "${vertex_metrics_dir_path}"
-#  fi
-#fi
 
 echo "[INFO] intact_pretrain.sh finished successfully."

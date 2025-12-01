@@ -20,56 +20,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-def validation_step(
-    model,
-    ddG_data,
-    dataset_valid,
-    batch_size=20000,
-    device="cuda"
-) -> dict[str, float | None]:
-    val_spearman = []
-    val_pearson = []
-    all_pred = []
-    all_labels = []
-    for sample in tqdm(dataset_valid):
-        pdb_name = sample["name"]
-        ddG = ddG_data[f"{pdb_name}.pdb"]["ddG"].to(device)
-        mut_seqs = ddG_data[f"{pdb_name}.pdb"]["mut_seqs"]
-        N = mut_seqs.shape[0]
-        M = (
-            batch_size // mut_seqs.shape[1]
-        )  # convert the number of tokens to the number of sequences per batch
-
-        sample_pred = []
-        # Batching for mutants
-        for batch_idx in range(0, N, M):
-            B = min(N - batch_idx, M)
-            # ddG prediction
-            pred = model.folding_ddG(sample, mut_seqs[batch_idx : batch_idx + B])
-            sample_pred.append(pred.detach().cpu())
-
-        pred = torch.cat(sample_pred)
-
-        sp, _ = spearmanr(pred.cpu().detach().numpy(), ddG.cpu().detach().numpy())
-        val_spearman.append(sp)
-
-        pr, _ = pearsonr(pred.cpu().detach().numpy(), ddG.cpu().detach().numpy())
-        val_pearson.append(pr)
-
-        all_pred.append(pred.cpu().detach().numpy())
-        all_labels.append(ddG.cpu().detach().numpy())
-
-    sp, _ = spearmanr(np.concatenate(all_pred), np.concatenate(all_labels))
-    pr, _ = pearsonr(np.concatenate(all_pred), np.concatenate(all_labels))
-
-    return {
-        "spearman": float(np.mean(val_spearman)),
-        "pearson": float(np.mean(val_pearson)),
-        "all_spearman": float(sp),
-        "all_pearson": float(pr),
-    }
-
-
 def finetune(
     model: ProteinMPNN,
     dataset_train: StructureDataset,

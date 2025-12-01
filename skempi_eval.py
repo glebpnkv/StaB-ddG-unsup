@@ -11,7 +11,13 @@ from stabddg.mpnn_utils import ProteinMPNN
 from stabddg.ppi_dataset import SKEMPIDataset, YeastDataset
 
 
-def eval(model, dataset, ensemble=20, batch_size=10000):
+def eval(
+    model,
+    dataset,
+    device,
+    ensemble=20,
+    batch_size=10000
+):
     val_spearman = []
     val_pearson = []
     val_rmse = []
@@ -29,15 +35,15 @@ def eval(model, dataset, ensemble=20, batch_size=10000):
 
         binding_ddG_pred_ensemble = []
         for _ in range(ensemble):
-            with torch.no_grad():
-                N = complex_mut_seqs.shape[0]
-                M = (
-                    batch_size // complex_mut_seqs.shape[1]
-                )  # convert number of tokens to number of sequences per batch
+            N = complex_mut_seqs.shape[0]
+            M = (
+                batch_size // complex_mut_seqs.shape[1]
+            )  # convert number of tokens to number of sequences per batch
 
-                binding_ddG_pred_ = []
-                for batch_idx in range(0, N, M):
-                    B = min(N - batch_idx, M)
+            binding_ddG_pred_ = []
+            for batch_idx in range(0, N, M):
+                B = min(N - batch_idx, M)
+                with torch.no_grad():
                     batch_binding_ddG_pred = model(
                         complex,
                         binder1,
@@ -46,19 +52,22 @@ def eval(model, dataset, ensemble=20, batch_size=10000):
                         binder1_mut_seqs[batch_idx : batch_idx + B],
                         binder2_mut_seqs[batch_idx : batch_idx + B],
                     )
-                    binding_ddG_pred_.append(batch_binding_ddG_pred.cpu().detach())
+                binding_ddG_pred_.append(batch_binding_ddG_pred)
 
-                binding_ddG_pred_ = torch.cat(binding_ddG_pred_)
+            binding_ddG_pred_ = torch.cat(binding_ddG_pred_)
 
-                binding_ddG_pred_ensemble.append(binding_ddG_pred_.squeeze().cpu())
+            binding_ddG_pred_ensemble.append(binding_ddG_pred_.squeeze())
 
-        binding_ddG_pred = torch.stack(binding_ddG_pred_ensemble).mean(dim=0)
+        binding_ddG_pred = torch.stack(binding_ddG_pred_ensemble).mean(dim=0).cpu()
+
+        # Move ddG to CPU once
+        ddG_cpu = ddG.cpu()
 
         name, mutations = sample["name"], sample["mutation_list"]
         data = {
             "#Pdb": [name] * len(mutations),  # Repeat the name for all rows
             "Mutation": mutations,
-            "ddG": ddG.cpu().detach().numpy(),
+            "ddG": ddG_cpu.detach().numpy(),
             "Prediction": binding_ddG_pred.cpu().detach().numpy(),
         }
 
@@ -165,7 +174,11 @@ if __name__ == "__main__":
     combined_df = None
     with torch.no_grad():
         pred_df = eval(
-            model, dataset, ensemble=args.ensemble, batch_size=args.batch_size
+            model=model,
+            dataset=dataset,
+            device=device,
+            ensemble=args.ensemble,
+            batch_size=args.batch_size
         )
         combined_df = pred_df[["#Pdb", "Mutation", "ddG"]]
         combined_df["ddG_pred"] = pred_df["Prediction"]

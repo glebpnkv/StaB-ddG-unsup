@@ -2,23 +2,11 @@ import argparse
 import logging
 import os
 
+from stabddg.misc import optional_int
 from stabddg.jobs.intact_pretrain import intact_pretrain
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
-
-def optional_int(value: str | None) -> int | None:
-    """
-    argparse type that treats 'null', 'none', and empty string as None.
-    Otherwise returns int(value).
-    """
-    if value is None:
-        return None
-    v = str(value).strip().lower()
-    if v in {"", "none", "null"}:
-        return None
-    return int(value)
 
 
 if __name__ == "__main__":

@@ -11,14 +11,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-dev \
     libffi-dev \
     bash \
+    wget \
+    tar \
+    unzip \
   && rm -rf /var/lib/apt/lists/*
 
+# Copy app code
+COPY . .
 # Install uv and sync project deps into a venv at /app/.venv
-COPY pyproject.toml .
 RUN python -m pip install -U pip && \
     python -m pip install --user uv
 ENV PATH="/root/.local/bin:${PATH}"
-RUN uv sync
+RUN uv sync --extra gcp
 ENV PATH="/app/.venv/bin:${PATH}"
 
 # Ensure pip is available in the venv (for Vertex components which sometimes invoke it)
@@ -28,11 +32,6 @@ RUN python -m ensurepip || true && python -m pip install -U pip
 RUN apt-get purge -y --auto-remove build-essential python3-dev git libffi-dev || true && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy app code
-COPY . .
-
-# Install the local package so `import stabddg` works
-RUN python -m pip install -e .
-
 # Adding execution permissions to the scripts
 RUN chmod +x /app/scripts/intact_pretrain.sh
+RUN chmod +x /app/scripts/download_stabddg_data.sh
