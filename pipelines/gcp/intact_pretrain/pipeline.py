@@ -18,11 +18,11 @@ BASE_IMAGE = os.environ.get("PIPELINE_BASE_IMAGE", "YOUR_ARTIFACT_REGISTRY_IMAGE
 
 # Hard-coded hardware specs (set once here; not configurable at runtime)
 # MACHINE_TYPE = "n2-standard-64"  # testing
-MACHINE_TYPE = "a2-highgpu-4g"
+MACHINE_TYPE = "a2-highgpu-2g"
 ACCELERATOR_TYPE = "NVIDIA_TESLA_A100"
 ACCELERATOR_COUNT = 2
 
-JOB_TIMEOUT = "172800s"   # 2 days
+JOB_TIMEOUT = "86400s"   # 1 day
 NUM_RETRIES = 0
 BACKOFF_DURATION = "600s"   # 10 minutes
 

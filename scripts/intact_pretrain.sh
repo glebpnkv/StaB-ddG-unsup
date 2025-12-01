@@ -28,7 +28,7 @@ noise_level=0.1
 normalize_loss="true"   # "true" -> --normalize_loss, "false" -> --no-normalize_loss
 
 # Data split settings
-intact_sample_size=1.0 # 1.0 -> use all data
+intact_sample_size="" # 1.0 -> use all data
 valid_size=0.1
 test_size=0.1
 random_state=42
@@ -165,6 +165,14 @@ else
 fi
 
 # -------- GPU detection --------
+echo "[INFO] Python / Torch CUDA sanity check:"
+python - <<'PY'
+import torch
+print("torch version:", torch.__version__)
+print("cuda is_available:", torch.cuda.is_available())
+print("device_count:", torch.cuda.device_count())
+PY
+
 gpu_count() {
   local count=0
 
@@ -240,13 +248,18 @@ BASE_ARGS=(
   --k_pos "${k_pos}"
   --k_neg "${k_neg}"
   --noise_level "${noise_level}"
-  --intact_sample_size "${intact_sample_size}"
   --valid_size "${valid_size}"
   --test_size "${test_size}"
   --random_state "${random_state}"
   --num_dataloader_workers "${num_dataloader_workers}"
   --model_val_freq "${model_val_freq}"
 )
+
+# Only pass intact_sample_size if explicitly set;
+# otherwise argparse default (None) is used in Python.
+if [[ -n "${intact_sample_size}" ]]; then
+  BASE_ARGS+=( --intact_sample_size "${intact_sample_size}" )
+fi
 
 if [[ "${normalize_loss}" == "true" ]]; then
   BASE_ARGS+=( --normalize_loss )

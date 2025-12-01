@@ -1,0 +1,21 @@
+FROM us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest
+
+# Set the working directory in the container
+WORKDIR /app
+
+# System build deps
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash \
+    && rm -rf /var/lib/apt/lists/*
+
+# Sync project deps
+COPY pyproject.toml .
+# Copy app code
+COPY . .
+
+RUN python -m pip install --upgrade pip \
+ && python -m pip install --no-cache-dir -e .
+
+# Adding execution permissions to the scripts
+RUN chmod +x /app/scripts/intact_pretrain.sh

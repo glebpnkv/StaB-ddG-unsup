@@ -8,6 +8,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def optional_int(value: str | None) -> int | None:
+    """
+    argparse type that treats 'null', 'none', and empty string as None.
+    Otherwise returns int(value).
+    """
+    if value is None:
+        return None
+    v = str(value).strip().lower()
+    if v in {"", "none", "null"}:
+        return None
+    return int(value)
+
+
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -83,7 +96,7 @@ if __name__ == "__main__":
     # Data split settings
     argparser.add_argument(
         "--intact_sample_size",
-        type=int,
+        type=optional_int,
         default=None,
         help="Overall number of IntAct data to use for training (useful for debugging)"
     )
