@@ -18,8 +18,8 @@ BASE_IMAGE = os.environ.get("PIPELINE_BASE_IMAGE", "YOUR_ARTIFACT_REGISTRY_IMAGE
 
 # Hard-coded hardware specs (set once here; not configurable at runtime)
 # MACHINE_TYPE = "n2-standard-64"  # testing
-MACHINE_TYPE = "a2-highgpu-2g"
-ACCELERATOR_TYPE = "NVIDIA_TESLA_A100"
+MACHINE_TYPE = "g2-standard-24"
+ACCELERATOR_TYPE = "NVIDIA_L4"
 ACCELERATOR_COUNT = 2
 
 JOB_TIMEOUT = "86400s"   # 1 day
@@ -35,13 +35,13 @@ def intact_pretrain_training_step(
     # --- Training configuration ---
     run_name: str = "intact-pretrain",
     model_save_gcs_uri: Optional[str] = None,  # e.g. gs://bucket/experiments/intact_pretrain
-    max_length: int = 256,
-    batch_size: int = 4,
+    max_length: int = 400,
+    batch_size: int = 2,
     epochs: int = 5,
     lr: float = 1e-3,
-    k_neutral: int = 32,
-    k_pos: int = 16,
-    k_neg: int = 16,
+    k_neutral: int = 20,
+    k_pos: int = 5,
+    k_neg: int = 5,
     noise_level: float = 0.1,
     normalize_loss: bool = True,
     valid_size: float = 0.1,

@@ -29,7 +29,7 @@ from stabddg.constants import (
 )
 from stabddg.intact.uniprot import fetch_uniprot_sequences
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # Silence chatty HTTP clients used under the hood by rcsbapi (httpx/urllib3)
@@ -957,7 +957,7 @@ def _write_assemblies_safetensors(
 
 
 def fetch_assembly_atoms_df(
-    assembly_key: str,
+    assembly: dict[str, str],
     *,
     chains: set[str] | None = None,
     atoms: set[str] | None = None,
@@ -968,6 +968,10 @@ def fetch_assembly_atoms_df(
     Download assembly mmCIF, parse to atom DataFrame, and build metadata.
     Returns (df_assemblies, metadata).
     """
+    assembly_key = assembly["biological_assembly"]
+    participant_protein = assembly["participant_protein"]
+    affected_protein_ac = assembly["affected_protein_ac"]
+
     try:
         entry_id = normalize_entry(assembly_key)
         chain_map = _fetch_chain_to_uniprot_map_rcsb(entry_id)
@@ -1000,8 +1004,21 @@ def fetch_assembly_atoms_df(
         df["item_id"] = assembly_key  # Adding assembly_key as an ID to DataFrame
         df["abs_pos_label"] = df["resnum_uniprot"]
 
-        entry_id = normalize_entry(assembly_key)
-        chain_map = {k: chain_map[k] for k in df["chain"].unique() if k in chain_map}
+        # Build metadata: chain -> UniProt using the entry-level chain map,
+        # but restricted to chains that actually appear in df["chain"].
+        df_chains = set(df["chain"].unique())
+        chain_map = {ch: chain_map[ch] for ch in df_chains if ch in chain_map}
+
+        # Ensuring that participant_protein and affected_protein_ac are present in chain_map
+        if not participant_protein in chain_map.values():
+            cur_msg = f"Participant protein {participant_protein} not found in assembly {assembly_key}"
+            logger.info(cur_msg)
+            raise ValueError(cur_msg)
+        if not affected_protein_ac in chain_map.values():
+            cur_msg = f"Affected protein {affected_protein_ac} not found in assembly {assembly_key}"
+            logger.info(cur_msg)
+            raise ValueError(cur_msg)
+
         metadata = chain_map | {
             "biological_assembly": assembly_key,
             "entry_id": entry_id,
@@ -1016,7 +1033,7 @@ def fetch_assembly_atoms_df(
 
 
 def fetch_assemblies_atoms_parallel(
-    asm_ids: list[str],
+    assemblies: list[dict[str, str]],
     chains: set[str] | None = None,
     atoms: set[str] | None = None,  # e.g., {"N","CA","C","O"} or None for all atoms
     include_het: bool = False,  # include waters/ligands if True
@@ -1036,10 +1053,12 @@ def fetch_assemblies_atoms_parallel(
         os.makedirs(parquet_dir, exist_ok=True)
     results: dict[str, dict] = {}
 
-    def _task(code: str) -> tuple[str, dict]:
+    def _task(assembly: dict[str, str]) -> tuple[str, dict]:
+        assembly_key = assembly["biological_assembly"]
+
         try:
             out = fetch_assembly_atoms_df(
-                code,
+                assembly,
                 chains=chains,
                 atoms=atoms,
                 include_het=include_het,
@@ -1048,32 +1067,32 @@ def fetch_assemblies_atoms_parallel(
 
             # Do nothing further if the download did not succeed
             if out["status"] != "success":
-                return code, out
+                return assembly_key, out
 
             if parquet_dir is not None:
-                parquet_path = os.path.join(parquet_dir, f"{code}.parquet")
+                parquet_path = os.path.join(parquet_dir, f"{assembly_key}.parquet")
                 out["df"].to_parquet(parquet_path, index=False)
                 out["parquet_path"] = parquet_path
             if safetensors_dir is not None:
                 st_path = _write_assemblies_safetensors(
-                    out["df"], safetensors_dir, code, metadata=out["metadata"]
+                    out["df"], safetensors_dir, assembly_key, metadata=out["metadata"]
                 )
                 out["safetensors_path"] = st_path
             # include df only if not saving to reduce memory
             if parquet_dir is not None and safetensors_dir is not None:
                 del out["df"]
-            return code, out
+            return assembly_key, out
         except Exception as e:
-            return code, {"status": str(e)}
+            return assembly_key, {"status": str(e)}
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(_task, code): code for code in asm_ids}
+        futs = {ex.submit(_task, assembly): assembly for assembly in assemblies}
         iterator = as_completed(futs)
         if show_progress:
             iterator = tqdm(iterator, total=len(futs), desc="Assemblies fetch")
         for fut in iterator:
-            code, out = fut.result()
-            results[code] = out
+            assembly_key, out = fut.result()
+            results[assembly_key] = out
 
     return results
 

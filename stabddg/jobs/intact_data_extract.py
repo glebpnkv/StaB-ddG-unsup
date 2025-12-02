@@ -122,10 +122,14 @@ def fetch_and_summarize_assemblies_atoms(
     os.makedirs(parquet_dir, exist_ok=True)
     os.makedirs(safetensors_dir, exist_ok=True)
 
-    assembly_ids = df_assemblies["biological_assembly"].unique().tolist()
+    assemblies = list(
+        df_assemblies[["biological_assembly", "participant_protein", "affected_protein_ac"]]
+        .to_dict(orient="index")
+        .values()
+    )
 
     step_outcome = fetch_assemblies_atoms_parallel(
-        asm_ids=assembly_ids,
+        assemblies=assemblies,
         parquet_dir=parquet_dir,
         safetensors_dir=safetensors_dir,
         max_workers=max_workers,
@@ -302,7 +306,8 @@ def extract_intact_data(
         uniprots_pairs=uniprots_pairs,
         max_workers=metadata_workers
     )
-    df_assemblies_raw.drop(columns=["mutations"], errors="ignore").to_parquet(
+    df_assemblies_raw = df_assemblies_raw.drop(columns=["mutations"], errors="ignore")
+    df_assemblies_raw.to_parquet(
         os.path.join(intact_dir, "df_assemblies_raw.parquet")
     )
 

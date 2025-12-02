@@ -15,13 +15,13 @@ model_save_gcs_uri=""
 local_root="/app"
 
 # Core training hyperparameters
-max_length=256
-batch_size=4
+max_length=400
+batch_size=2
 epochs=5
 lr=1e-3
-k_neutral=32
-k_pos=16
-k_neg=16
+k_neutral=20
+k_pos=5
+k_neg=5
 noise_level=0.1
 normalize_loss="true"   # "true" -> --normalize_loss, "false" -> --no-normalize_loss
 

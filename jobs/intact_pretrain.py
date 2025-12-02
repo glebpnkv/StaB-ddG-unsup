@@ -54,15 +54,15 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--max_length",
         type=int,
-        default=256,
+        default=400,
         help="Max sequence length / truncation length"
     )
-    argparser.add_argument("--k_neutral", type=int, default=32, help="Number of neutral samples per batch")
-    argparser.add_argument("--k_pos", type=int, default=16, help="Number of positive samples per batch")
-    argparser.add_argument("--k_neg", type=int, default=16, help="Number of negative samples per batch")
+    argparser.add_argument("--k_neutral", type=int, default=20, help="Number of neutral samples per batch")
+    argparser.add_argument("--k_pos", type=int, default=5, help="Number of positive samples per batch")
+    argparser.add_argument("--k_neg", type=int, default=5, help="Number of negative samples per batch")
 
     # Core training hyperparameters
-    argparser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    argparser.add_argument("--batch_size", type=int, default=2, help="Batch size")
     argparser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
     argparser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
 
@@ -119,14 +119,6 @@ if __name__ == "__main__":
         help="Path to an existing ProteinMPNN/StaBddG checkpoint to initialize from; if omitted, start from scratch"
     )
 
-    # torchrun passes --local_rank automatically
-    argparser.add_argument(
-        "--local_rank",
-        type=int,
-        default=-1,
-        help="Local rank passed by torchrun."
-    )
-
     args = argparser.parse_args()
 
     intact_pretrain(
@@ -153,5 +145,4 @@ if __name__ == "__main__":
         use_antithetic_variates=args.use_antithetic_variates,
         model_existing_checkpoint=args.model_existing_checkpoint,
         use_wandb=args.wandb,
-        local_rank=args.local_rank,
     )

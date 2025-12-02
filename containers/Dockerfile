@@ -22,7 +22,7 @@ COPY . .
 RUN python -m pip install -U pip && \
     python -m pip install --user uv
 ENV PATH="/root/.local/bin:${PATH}"
-RUN uv sync --extra gcp
+RUN uv sync --extra gcp --extra pytorch_cpu
 ENV PATH="/app/.venv/bin:${PATH}"
 
 # Ensure pip is available in the venv (for Vertex components which sometimes invoke it)

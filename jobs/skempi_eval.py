@@ -22,7 +22,7 @@ if __name__ == "__main__":
     )
 
     argparser.add_argument("--run_name", type=str, default="skempi-eval")
-    argparser.add_argument("--checkpoint", type=str, default="./model_ckpts/stabddg.pt")
+    argparser.add_argument("--checkpoint", type=str, default="./model_ckpts/proteinmpnn.pt")
     argparser.add_argument("--skempi_path", type=str, default="data/SKEMPI/filtered_skempi.csv")
     argparser.add_argument("--skempi_pdb_dir", type=str, default="")
     argparser.add_argument("--skempi_pdb_cache_path", type=str, default="cache/skempi_full_mask_pdb_dict.pkl")

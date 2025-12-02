@@ -7,10 +7,7 @@ import torch
 import wandb
 from sklearn.model_selection import train_test_split
 
-from stabddg.intact.dataset import (
-    IntactDataset,
-    # IntactContrastiveStream
-)
+from stabddg.intact.dataset import IntactDataset
 from stabddg.intact.training import pretrain
 from stabddg.model import StaBddG
 from stabddg.mpnn_utils import ProteinMPNN
@@ -38,6 +35,11 @@ def prepare_intact_splits(
     tuple[str, str, str]
         Paths to (train_path, valid_path, test_path)
     """
+    # Checks on valid_size and test_size
+    assert valid_size + test_size <= 1.0, "valid_size + test_size must be <= 1.0"
+    assert valid_size >= 0.0, "valid_size must be >= 0.0"
+    assert test_size >= 0.0, "test_size must be >= 0.0"
+
     # Ensure output directory exists
     out_dir = os.path.join(model_save_dir, splits_subdir)
     os.makedirs(out_dir, exist_ok=True)
@@ -101,23 +103,32 @@ def prepare_intact_splits(
         )
 
     # Stratified split: train vs (valid+test)
-    df_train, df_valid_all = train_test_split(
-        df,
-        test_size=(valid_size + test_size),
-        stratify=df["feature_type_category"],
-        random_state=random_state,
-    )
+    if valid_size + test_size > 0:
+        df_train, df_valid_all = train_test_split(
+            df,
+            test_size=(valid_size + test_size),
+            stratify=df["feature_type_category"],
+            random_state=random_state,
+        )
+    else:
+        df_train = df
+        df_valid_all = None
 
     # Split (valid+test) into valid and test
-    df_valid, df_test = train_test_split(
-        df_valid_all,
-        test_size=test_size / (valid_size + test_size),
-        stratify=df_valid_all["feature_type_category"],
-        random_state=random_state,
-    )
+    if df_valid_all is None:
+        df_valid, df_test = None, None
+    else:
+        df_valid, df_test = train_test_split(
+            df_valid_all,
+            test_size=test_size / (valid_size + test_size),
+            stratify=df_valid_all["feature_type_category"],
+            random_state=random_state,
+        )
 
     # Drop helper column and reset indices
     for df_cur in [df_train, df_valid, df_test]:
+        if df_cur is None:
+            continue
         df_cur.drop(columns=["feature_type_category"], inplace=True)
         df_cur.reset_index(drop=True, inplace=True)
 
@@ -127,8 +138,16 @@ def prepare_intact_splits(
     test_path = os.path.join(out_dir, "df_intact_mutations_filtered_test.parquet")
 
     df_train.to_parquet(train_path)
-    df_valid.to_parquet(valid_path)
-    df_test.to_parquet(test_path)
+
+    if df_valid is None:
+        valid_path = None
+    else:
+        df_valid.to_parquet(valid_path)
+
+    if df_test is None:
+        test_path = None
+    else:
+        df_test.to_parquet(test_path)
 
     return train_path, valid_path, test_path
 
@@ -156,9 +175,23 @@ def intact_pretrain(
     use_antithetic_variates: bool = True,
     model_existing_checkpoint: str = None,
     use_wandb: bool = False,
-    local_rank: int = -1,
     intact_sample_size: Optional[int] = None,
 ):
+    # Resolve local_rank from env when launched via torchrun
+    env_local_rank = os.environ.get("LOCAL_RANK")
+    if env_local_rank is not None:
+        try:
+            local_rank = int(env_local_rank)
+        except ValueError:
+            local_rank == -1
+
+    logger.info(
+        f"local_rank (arg): {local_rank}, "
+        f"env LOCAL_RANK={os.environ.get('LOCAL_RANK')}, "
+        f"RANK={os.environ.get('RANK')}, "
+        f"WORLD_SIZE={os.environ.get('WORLD_SIZE')}"
+    )
+
     # Getting the device
     device = get_device(local_rank=local_rank)
     logger.info(f"Using device: {device}")

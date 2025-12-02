@@ -77,7 +77,7 @@ local_skempi_csv="${local_skempi_dir}/filtered_skempi.csv"
 local_skempi_split="${local_skempi_dir}/test_pdb.pkl"
 local_skempi_pdb_dir="${local_data_dir}/PDBs"
 local_skempi_pdb_cache="${local_cache_dir}/skempi_full_mask_pdb_dict.pkl"
-local_checkpoint="${local_ckpt_dir}/stabddg.pt"
+local_checkpoint="${local_ckpt_dir}/proteinmpnn.pt"
 local_output_dir="${local_run_dir}"
 
 mkdir -p "${local_skempi_dir}" \
@@ -110,7 +110,7 @@ if [[ -n "${model_ckpt_gcs_uri}" ]]; then
     if [[ -f "${tmp_ckpt_dir}/stabddg.pt" ]]; then
       downloaded_ckpt="${tmp_ckpt_dir}/stabddg.pt"
     else
-      # Otherwise, take the first .pt file (or you could sort by mtime)
+      # Otherwise, take the first .pt file
       downloaded_ckpt="$(ls "${tmp_ckpt_dir}"/*.pt | head -n 1)"
     fi
   fi
