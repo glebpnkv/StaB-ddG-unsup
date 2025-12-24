@@ -4,14 +4,13 @@ import os
 import pandas as pd
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import wandb
 from torch.amp import autocast, GradScaler
-from torch.nn.modules.loss import _Loss
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 
 from stabddg.intact.dataset import IntactDataset, IntactContrastiveStream, intact_collate_fn, passthrough_collate_fn
+from stabddg.intact.losses import ContrastiveLoss
 from stabddg.model import StaBddG
 from stabddg.training import _is_dist_initialized, _is_main_process, _unwrap_model
 
@@ -21,127 +20,35 @@ default_amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.i
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
 
-class ContrastiveLoss(_Loss):
-    __constants__ = ["reduction"]
 
-    def __init__(
-        self,
-        tau_pos: float = 1.0,
-        tau_neg: float = 1.0,
-        lambda_pos: float = 1.0,
-        lambda_neg: float = 1.0,
-        reduction: str = "mean",
-        normalize: bool = False,
-    ):
-        self.tau_pos = tau_pos
-        self.tau_neg = tau_neg
-        self.lambda_pos = lambda_pos
-        self.lambda_neg = lambda_neg
-        self.normalize = normalize
-        super(ContrastiveLoss, self).__init__(reduction=reduction)
+def _maybe_float(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
-    def _component_losses(self, z, z_sign, z_pos, z_neg, z_neu):
-        """
-        Compute per-sample component losses before weighting and final reduction.
-        Returns:
-          loss_pos_vec: (B,) tensor
-          loss_neg_vec: (B,) tensor
-        """
-        # Normalising inputs
-        if self.normalize:
-            z = F.normalize(z, dim=0)
-            z_pos = F.normalize(z_pos, dim=0)
-            z_neg = F.normalize(z_neg, dim=0)
-            z_neu = F.normalize(z_neu, dim=0)
 
-        # Concatenating positive and negative samples
-        z_posneg = torch.cat([z_pos, z_neg], dim=0)
-        z_posneg_sign = torch.cat([torch.ones_like(z_pos), -torch.ones_like(z_neg)], dim=0)
+def _log_epoch_metrics(tb_writer, metrics, split_name, step):
+    if not metrics:
+        return
 
-        # Weights matrix indicating positive and negative samples
-        w = (z_sign * z_posneg_sign.T)
-        same_mask = (w > 0)
-        opp_mask = (w < 0)
+    payload = {}
+    for k, v in metrics.items():
+        v_float = _maybe_float(v)
+        if v_float is None:
+            continue
+        payload[f"{split_name}/epoch/{k}"] = v_float
 
-        # Calculating cosine similarities
-        s = (z @ z_posneg.T)         # (B, N)
-        s_pos = s / self.tau_pos     # (B, N)
-        s_neg = s / self.tau_neg     # (B, N)
-
-        # Neutral denominators (mirrored space for the opp term)
-        s_neu = (z @ z_neu.T)  # (B, B_neu)
-        lse_neu_pos = torch.logsumexp(s_neu / self.tau_pos, dim=1, keepdim=True)  # [B, 1]
-        lse_neu_neg = torch.logsumexp(-s_neu / self.tau_neg, dim=1, keepdim=True)  # [B, 1]
-
-        # Counts per anchor
-        pos_count = same_mask.sum(dim=1, keepdim=True)  # [B, 1]
-        neg_count = opp_mask.sum(dim=1, keepdim=True)  # [B, 1]
-
-        # Sums over selected pairs
-        same_mask_f = same_mask.to(s.dtype)
-        opp_mask_f = opp_mask.to(s.dtype)
-        pos_sum = (s_pos * same_mask_f).sum(dim=1, keepdim=True)  # [B, 1]
-        neg_sum = (s_neg * opp_mask_f).sum(dim=1, keepdim=True)  # [B, 1]
-
-        # Safe divisors
-        pos_count_safe = torch.clamp(pos_count, min=1)
-        neg_count_safe = torch.clamp(neg_count, min=1)
-
-        # Averaging: subtract count * LSE, then divide by count
-        # Note that the ddG value for +ve pairs should be negative
-        loss_pos_vec = -(pos_sum - pos_count * lse_neu_pos) / pos_count_safe
-        loss_neg_vec = -(-neg_sum - neg_count * lse_neu_neg) / neg_count_safe
-
-        # Zero-out anchors with no samples of that type
-        loss_pos_vec = loss_pos_vec * (pos_count > 0).to(s.dtype)
-        loss_neg_vec = loss_neg_vec * (neg_count > 0).to(s.dtype)
-
-        return loss_pos_vec.squeeze(1), loss_neg_vec.squeeze(1)
-
-    def _reduce(self, x: torch.Tensor) -> torch.Tensor:
-        if self.reduction == "mean":
-            return x.mean()
-        if self.reduction == "sum":
-            return x.sum()
-        # 'none' or any other value: return as-is
-        return x
-
-    def forward(self, z, z_sign, z_pos, z_neg, z_neu):
-        """
-        Returns a differentiable scalar (or vector if reduction='none') loss.
-        """
-        loss_pos_vec, loss_neg_vec = self._component_losses(z, z_sign, z_pos, z_neg, z_neu)
-        total_vec = self.lambda_pos * loss_pos_vec + self.lambda_neg * loss_neg_vec
-        loss = self._reduce(total_vec)
-        return loss
-
-    def return_losses_and_metrics(
-        self,
-        z: torch.Tensor,
-        z_sign: torch.Tensor,
-        z_pos: torch.Tensor,
-        z_neg: torch.Tensor,
-        z_neu: torch.Tensor
-    ):
-        """
-        Returns:
-          loss: differentiable tensor (scalar unless reduction='none')
-          metrics: dict of detached scalar components:
-            - 'loss': reduced total loss
-            - 'loss_pos': reduced positive component (unweighted)
-            - 'loss_neg': reduced negative component (unweighted)
-        """
-        loss_pos_vec, loss_neg_vec = self._component_losses(z, z_sign, z_pos, z_neg, z_neu)
-        total_vec = self.lambda_pos * loss_pos_vec + self.lambda_neg * loss_neg_vec
-        loss = self._reduce(total_vec)
-
-        metrics = {
-            "loss": self._reduce(total_vec.detach()).item(),
-            "loss_pos": self._reduce(loss_pos_vec.detach()).item(),
-            "loss_neg": self._reduce(loss_neg_vec.detach()).item(),
-        }
-        return loss, metrics
+    if tb_writer is not None:
+        for k, v in payload.items():
+            tb_writer.add_scalar(k, v, step)
 
 
 def train_step(
@@ -153,7 +60,8 @@ def train_step(
     epoch: int,
     output_logger = logger,
     grad_accum_steps: int = 1,
-    amp_dtype: torch.dtype = default_amp_dtype
+    amp_dtype: torch.dtype = default_amp_dtype,
+    tb_writer = None,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     # Preparing the model and the optimiser for training
     _unwrap_model(model).train()
@@ -169,6 +77,8 @@ def train_step(
 
     i = 0
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False, disable=not _is_main_process())
+    
+    # Iterating over batches
     for batch in pbar:
         # Fetching a sample of contrastive datapoints
         batch_contrast = next(iter(dataloader_contrastive))
@@ -212,6 +122,12 @@ def train_step(
                 f'{print_prefix}: Batch {i + 1} Train metrics: '
                 f'{ {k: "{0:0.4f}".format(v) for k, v in metrics.items() if v is not None} }'
             )
+            if tb_writer is not None:
+                step = epoch * len(dataloader) + i + 1
+                for k, v in metrics.items():
+                    v_float = _maybe_float(v)
+                    if v_float is not None:
+                        tb_writer.add_scalar(f"train/step/{k}", v_float, step)
 
         if not all_train_metrics:
             all_train_metrics = metrics
@@ -253,6 +169,7 @@ def validation_step(
     step_name: str = "Validation",
     output_logger = logger,
     amp_dtype: torch.dtype = default_amp_dtype,
+    tb_writer = None,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     _unwrap_model(model).eval()
     print_prefix = f"Epoch {epoch + 1}"
@@ -292,6 +209,13 @@ def validation_step(
                     f'{print_prefix}: Batch {i + 1} {step_name} metrics: '
                     f'{ {k: "{0:0.4f}".format(v) for k, v in metrics.items() if v is not None} }'
                 )
+                if tb_writer is not None:
+                    step = epoch * len(dataloader) + i + 1
+                    split_prefix = step_name.lower()
+                    for k, v in metrics.items():
+                        v_float = _maybe_float(v)
+                        if v_float is not None:
+                            tb_writer.add_scalar(f"{split_prefix}/step/{k}", v_float, step)
 
             if not all_metrics:
                 all_metrics = metrics
@@ -332,7 +256,8 @@ def pretrain(
     batch_size: int = 4,
     num_dataloader_workers: int = 1,
     lr: float = 1e-4,
-    normalize_loss: bool = True,
+    lambda_sign: float = 10.0,
+    lambda_neutral: float = 0.0,
     n_epochs: int = 10,
     model_val_freq: int = 2,
     model_save_freq: int = 1,
@@ -341,9 +266,8 @@ def pretrain(
 ):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = ContrastiveLoss(
-        lambda_pos=1.0,
-        lambda_neg=dataset_train.df_pos.shape[0] / dataset_train.df_neg.shape[0],
-        normalize=normalize_loss
+        lambda_sign=lambda_sign,
+        lambda_neutral=lambda_neutral,
     )
 
     # DataFrame with training, validation and test metrics
@@ -354,12 +278,14 @@ def pretrain(
     # Directory to save model checkpoints
     model_save_dir = os.path.join(save_dir, "model")
     metrics_save_dir = os.path.join(save_dir, "metrics")
+    default_tensorboard_log_dir = os.path.join(save_dir, "tb_logs")
     if _is_main_process():
         logger.info(f"Creating directory {save_dir}")
 
         os.makedirs(save_dir, exist_ok=True)
         os.makedirs(model_save_dir, exist_ok=True)
         os.makedirs(metrics_save_dir, exist_ok=True)
+        os.makedirs(default_tensorboard_log_dir, exist_ok=True)
 
     # Creating a logging file logs.txt (main process only)
     if _is_main_process():
@@ -427,6 +353,23 @@ def pretrain(
         )
 
     # Iterating over epochs
+    tb_writer = None
+    tensorboard_log_dir = os.environ.get("AIP_TENSORBOARD_LOG_DIR", default_tensorboard_log_dir)
+
+    logger.info("AIP_TENSORBOARD_LOG_DIR env: %s", os.environ.get("AIP_TENSORBOARD_LOG_DIR"))
+    logger.info("Resolved tensorboard_log_dir: %s", tensorboard_log_dir)
+    logger.info("SummaryWriter available: %s", SummaryWriter is not None)
+
+    if _is_main_process() and tensorboard_log_dir and SummaryWriter is not None:
+        try:
+            tb_writer = SummaryWriter(log_dir=tensorboard_log_dir)
+            logger.info("TensorBoard writer ENABLED (log_dir=%s)", tensorboard_log_dir)
+            tb_writer.flush()
+        except Exception as exc:
+            logger.warning("Failed to create TensorBoard writer: %s", exc)
+    else:
+        logger.info("TensorBoard writer DISABLED (rank!=0 or no log dir)")
+
     for epoch in tqdm(range(n_epochs), desc="Epoch"):
         # Running training step
         train_metrics, df_forecasts_train = train_step(
@@ -438,6 +381,7 @@ def pretrain(
             epoch=epoch,
             grad_accum_steps=grad_accum_steps,
             output_logger=logger_file,
+            tb_writer=tb_writer,
         )
 
         # Collecting metrics from the training step
@@ -453,6 +397,15 @@ def pretrain(
             )
             df_metrics = pd.concat([df_metrics, df_train_metrics], ignore_index=True)
             df_forecasts = pd.concat([df_forecasts, df_forecasts_train], ignore_index=True)
+
+            # Adding epoch train metrics to TensorBoard
+            _log_epoch_metrics(tb_writer, train_metrics, "train", epoch + 1)
+            _log_epoch_metrics(
+                tb_writer,
+                {"lr": optimizer.param_groups[0]["lr"]},
+                "train",
+                epoch + 1,
+            )
             
             # Potentially saving model checkpoint
             if (epoch + 1) % model_save_freq == 0:
@@ -472,6 +425,7 @@ def pretrain(
                 epoch=epoch,
                 output_logger=logger_file,
                 step_name="Validation",
+                tb_writer=tb_writer,
             )
 
             if _is_main_process():
@@ -487,14 +441,17 @@ def pretrain(
                 df_metrics = pd.concat([df_metrics, df_valid_metrics], ignore_index=True)
                 df_forecasts = pd.concat([df_forecasts, df_forecasts_valid], ignore_index=True)
 
+                # Adding epoch validation metrics to TensorBoard
+                _log_epoch_metrics(tb_writer, valid_metrics, "validation", epoch + 1)
+
+                if use_wandb:
+                    wandb.log(valid_metrics, step=epoch + 1)
+                    wandb.log({"lr": optimizer.param_groups[0]["lr"],}, step=epoch + 1)
+
         # Save metrics and forecasts as CSV
         if _is_main_process():
             df_metrics.to_csv(os.path.join(metrics_save_dir, "metrics.csv"), index=False)
             df_forecasts.to_csv(os.path.join(metrics_save_dir, "forecasts.csv"), index=False)
-
-            if use_wandb:
-                wandb.log(valid_metrics, step=epoch + 1)
-                wandb.log({"lr": optimizer.param_groups[0]["lr"],}, step=epoch + 1)
 
     # Calculating the test metrics at the end of the training loop
     logger.info("Calculating test metrics at the end of the training loop")
@@ -521,6 +478,8 @@ def pretrain(
         df_metrics = pd.concat([df_metrics, df_test_metrics], ignore_index=True)
         df_forecasts = pd.concat([df_forecasts, df_forecasts_test], ignore_index=True)
 
+        _log_epoch_metrics(tb_writer, test_metrics, "test", n_epochs)
+
         df_metrics.to_csv(os.path.join(metrics_save_dir, "metrics.csv"), index=False)
         df_forecasts.to_csv(os.path.join(metrics_save_dir, "forecasts.csv"), index=False)
 
@@ -529,3 +488,7 @@ def pretrain(
         torch.save(
             _unwrap_model(model).pmpnn.state_dict(), f"{model_save_dir}/final.pt"
         )
+
+    if tb_writer is not None:
+        tb_writer.flush()
+        tb_writer.close()

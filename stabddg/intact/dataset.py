@@ -33,6 +33,18 @@ INTERNAL_TENSOR_KEYS = [
 
 
 def pad_or_trim_dim1(t: torch.Tensor, target_len: int) -> torch.Tensor:
+    """
+    Adjusts the size of the first dimension (dim=1) of the given tensor to match the specified target length.
+    If the tensor's current size in dim=1 is greater than the target length, it trims the excess elements.
+    If the current size is smaller, it pads the tensor on the right to reach the target length.
+
+    Parameters:
+    t (torch.Tensor): The tensor to be adjusted in its first dimension.
+    target_len (int): The desired size of the tensor's first dimension.
+
+    Returns:
+    torch.Tensor: A new tensor with the adjusted size in the first dimension.
+    """
     cur = t.size(1)
     if cur == target_len:
         return t
@@ -128,7 +140,7 @@ class IntactDataset(Dataset):
         len_filtered = len(df)
 
         logger.info(
-            f"Kept {len_filtered} rows out of {len_raw} with sequence length > {max_length} ("
+            f"Kept {len_filtered} rows out of {len_raw} with sequence length ≤ {max_length} ("
             f"{len_raw - len_filtered} rows were removed)"
         )
 

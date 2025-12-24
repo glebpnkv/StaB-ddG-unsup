@@ -73,12 +73,19 @@ if __name__ == "__main__":
         default=0.1,
         help="Noise level for StaBddG antithetic variates"
     )
+
     argparser.add_argument(
-        "--normalize_loss",
-        dest="normalize_loss",
-        action="store_true",
-        default=True,
-        help="Normalize loss by item counts"
+        "--lambda_sign",
+        type=float,
+        default=0.0,
+        help="Weight for sign loss"
+    )
+
+    argparser.add_argument(
+        "--lambda_neutral",
+        type=float,
+        default=0.0,
+        help="Weight for scale of neutral forecasts"
     )
 
     # Data split settings
@@ -115,11 +122,13 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--model_existing_checkpoint",
         type=str,
-        default=os.path.join("../../model_ckpts", "proteinmpnn.pt"),
+        default="",
         help="Path to an existing ProteinMPNN/StaBddG checkpoint to initialize from; if omitted, start from scratch"
     )
 
     args = argparser.parse_args()
+
+    model_existing_checkpoint = None if args.model_existing_checkpoint == "" else args.model_existing_checkpoint
 
     intact_pretrain(
         run_name=args.run_name,
@@ -135,7 +144,8 @@ if __name__ == "__main__":
         epochs=args.epochs,
         lr=args.lr,
         noise_level=args.noise_level,
-        normalize_loss=args.normalize_loss,
+        lambda_sign=args.lambda_sign,
+        lambda_neutral=args.lambda_neutral,
         intact_sample_size=args.intact_sample_size,
         valid_size=args.valid_size,
         test_size=args.test_size,
@@ -143,6 +153,6 @@ if __name__ == "__main__":
         num_dataloader_workers=args.num_dataloader_workers,
         model_val_freq=args.model_val_freq,
         use_antithetic_variates=args.use_antithetic_variates,
-        model_existing_checkpoint=args.model_existing_checkpoint,
+        model_existing_checkpoint=model_existing_checkpoint,
         use_wandb=args.wandb,
     )

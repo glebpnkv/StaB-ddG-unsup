@@ -9,7 +9,6 @@ run_name="intact-pretrain"
 # GCS locations (if empty, no GCS copy is attempted)
 intact_data_gcs_uri=""
 model_ckpt_gcs_uri=""
-model_save_gcs_uri=""
 
 # Local root inside container / VM
 local_root="/app"
@@ -23,7 +22,8 @@ k_neutral=20
 k_pos=5
 k_neg=5
 noise_level=0.1
-normalize_loss="true"   # "true" -> --normalize_loss, "false" -> --no-normalize_loss
+lambda_sign=10.0
+lambda_neutral=0.0
 
 # Data split settings
 intact_sample_size="" # 1.0 -> use all data
@@ -51,6 +51,7 @@ use_torchrun="auto"
 # Optional: paths for KFP artifact outputs (within the container FS)
 vertex_model_dir_path=""
 vertex_metrics_dir_path=""
+vertex_data_splits_dir_path=""
 
 # ------------------------------------------------
 # Optional: activate a venv if present (safe no-op otherwise)
@@ -69,7 +70,6 @@ while [[ $# -gt 0 ]]; do
     --run_name)                 run_name="${2:-$run_name}"; shift 2 ;;
     --intact_data_gcs_uri)      intact_data_gcs_uri="${2:-}"; shift 2 ;;
     --model_ckpt_gcs_uri)       model_ckpt_gcs_uri="${2:-}"; shift 2 ;;
-    --model_save_gcs_uri)       model_save_gcs_uri="${2:-}"; shift 2 ;;
     --local_root)               local_root="${2:-$local_root}"; shift 2 ;;
     --max_length)               max_length="${2:-$max_length}"; shift 2 ;;
     --batch_size)               batch_size="${2:-$batch_size}"; shift 2 ;;
@@ -79,7 +79,8 @@ while [[ $# -gt 0 ]]; do
     --k_pos)                    k_pos="${2:-$k_pos}"; shift 2 ;;
     --k_neg)                    k_neg="${2:-$k_neg}"; shift 2 ;;
     --noise_level)              noise_level="${2:-$noise_level}"; shift 2 ;;
-    --normalize_loss)           normalize_loss="${2:-$normalize_loss}"; shift 2 ;;
+    --lambda_sign)              lambda_sign="${2:-$lambda_sign}"; shift 2 ;;
+    --lambda_neutral)           lambda_neutral="${2:-$lambda_neutral}"; shift 2 ;;
     --intact_sample_size)       intact_sample_size="${2:-$intact_sample_size}"; shift 2 ;;
     --valid_size)               valid_size="${2:-$valid_size}"; shift 2 ;;
     --test_size)                test_size="${2:-$test_size}"; shift 2 ;;
@@ -88,10 +89,10 @@ while [[ $# -gt 0 ]]; do
     --model_val_freq)           model_val_freq="${2:-$model_val_freq}"; shift 2 ;;
     --use_wandb)                use_wandb="${2:-$use_wandb}"; shift 2 ;;
     --use_antithetic_variates)  use_antithetic_variates="${2:-true}"; shift 2 ;; # kept for backward compat
-    --model_existing_checkpoint) model_existing_checkpoint="${2:-}"; shift 2 ;;
     --use_torchrun)             use_torchrun="${2:-$use_torchrun}"; shift 2 ;;
     --vertex_model_dir_path)    vertex_model_dir_path="${2:-}"; shift 2 ;;
     --vertex_metrics_dir_path)  vertex_metrics_dir_path="${2:-}"; shift 2 ;;
+    --vertex_data_splits_dir_path) vertex_data_splits_dir_path="${2:-}"; shift 2 ;;
     *)
       echo "Unknown argument: $1" >&2
       exit 1
@@ -102,8 +103,55 @@ done
 echo "[INFO] run_name=${run_name}"
 echo "[INFO] intact_data_gcs_uri=${intact_data_gcs_uri}"
 echo "[INFO] model_ckpt_gcs_uri=${model_ckpt_gcs_uri}"
-echo "[INFO] model_save_gcs_uri=${model_save_gcs_uri}"
 echo "[INFO] local_root=${local_root}"
+# -------- Vertex env debug --------
+echo "[INFO] AIP_TENSORBOARD_LOG_DIR=${AIP_TENSORBOARD_LOG_DIR:-<unset>}"
+echo "[INFO] AIP_MODEL_DIR=${AIP_MODEL_DIR:-<unset>}"
+echo "[INFO] AIP_CHECKPOINT_DIR=${AIP_CHECKPOINT_DIR:-<unset>}"
+
+# -------- TensorBoard shim: local write + periodic sync to GCS --------
+TB_GCS_DIR="${AIP_TENSORBOARD_LOG_DIR:-}"
+
+if [[ -n "${TB_GCS_DIR}" && "${TB_GCS_DIR}" == gs://* ]]; then
+  TB_GCS_OUTPUT_DIR="${TB_GCS_DIR}${run_name}"
+  TB_LOCAL_DIR="/tmp/tensorboard/${run_name}"
+  mkdir -p "${TB_LOCAL_DIR}"
+
+  # IMPORTANT: PyTorch SummaryWriter needs a local path. We overwrite the env var for the training process.
+  export AIP_TENSORBOARD_LOG_DIR="${TB_LOCAL_DIR}"
+
+  TB_SYNC_INTERVAL_SEC="${TB_SYNC_INTERVAL_SEC:-60}"
+  echo "[INFO] TensorBoard: writing locally to ${TB_LOCAL_DIR}"
+  echo "[INFO] TensorBoard: syncing to ${TB_GCS_OUTPUT_DIR} every ${TB_SYNC_INTERVAL_SEC}s"
+
+  tb_sync_once() {
+    # Prefer gsutil if present (fast + incremental).
+    if command -v gsutil >/dev/null 2>&1; then
+      gsutil -m rsync -r "${TB_LOCAL_DIR}" "${TB_GCS_OUTPUT_DIR}"
+      return $?
+    fi
+
+    echo "[WARN] gsutil not found; cannot sync TB logs to GCS. Add gsutil/gcloud to the image."
+    return 0
+  }
+
+  # First sync (so you see errors immediately if auth/path is wrong)
+  tb_sync_once || echo "[WARN] Initial TensorBoard sync failed (will keep trying)."
+
+  tb_sync_loop() {
+    while true; do
+      tb_sync_once >/dev/null 2>&1 || true
+      sleep "${TB_SYNC_INTERVAL_SEC}"
+    done
+  }
+
+  tb_sync_loop & TB_SYNC_PID=$!
+
+  # Ensure we do a final sync and kill the background loop
+  trap 'set +e; echo "[INFO] Final TensorBoard sync..."; tb_sync_once; [[ -n "${TB_SYNC_PID:-}" ]] && kill "${TB_SYNC_PID}" 2>/dev/null || true' EXIT
+else
+  echo "[INFO] AIP_TENSORBOARD_LOG_DIR is not a gs:// URI (or unset). TensorBoard streaming likely disabled."
+fi
 
 # -------- Local paths derived from local_root --------
 local_data_dir="${local_root}/data/intact"
@@ -127,21 +175,20 @@ else
 fi
 
 if [[ -n "${model_ckpt_gcs_uri}" ]]; then
-  echo "[INFO] Copying existing model checkpoints from GCS..."
-  python "${transfer_script}" download "${model_ckpt_gcs_uri}" "${local_ckpt_dir}/" || echo "[WARN] No ckpts to copy"
-fi
+  echo "[INFO] Copying existing model checkpoint from GCS..."
+  # Download into a temporary subdir under local_ckpt_dir to avoid collisions
+  tmp_ckpt_dir="${local_ckpt_dir}/_download"
+  mkdir -p "${tmp_ckpt_dir}"
+  python "${transfer_script}" download "${model_ckpt_gcs_uri}" "${tmp_ckpt_dir}/" || echo "[WARN] No ckpts downloaded"
 
-# Determine existing checkpoint if not explicitly provided
-if [[ -z "${model_existing_checkpoint}" ]]; then
-  if [[ -f "${local_ckpt_dir}/proteinmpnn.pt" ]]; then
-    model_existing_checkpoint="${local_ckpt_dir}/proteinmpnn.pt"
+  # Find a .pt file under tmp_ckpt_dir
+  if ls "${tmp_ckpt_dir}"/*.pt >/dev/null 2>&1; then
+    # Take the first .pt file
+    model_existing_checkpoint="$(ls "${tmp_ckpt_dir}"/*.pt | head -n 1)"
+    echo "[INFO] Using downloaded checkpoint: ${model_existing_checkpoint}"
+  else
+    echo "[WARN] No .pt files found under ${tmp_ckpt_dir}"
   fi
-fi
-
-if [[ -n "${model_existing_checkpoint}" ]]; then
-  echo "[INFO] Using existing checkpoint: ${model_existing_checkpoint}"
-else
-  echo "[INFO] No existing checkpoint; training from scratch."
 fi
 
 # -------- GPU detection --------
@@ -224,6 +271,8 @@ BASE_ARGS=(
   --k_pos "${k_pos}"
   --k_neg "${k_neg}"
   --noise_level "${noise_level}"
+  --lambda_sign "${lambda_sign}"
+  --lambda_neutral "${lambda_neutral}"
   --valid_size "${valid_size}"
   --test_size "${test_size}"
   --random_state "${random_state}"
@@ -235,12 +284,6 @@ BASE_ARGS=(
 # otherwise argparse default (None) is used in Python.
 if [[ -n "${intact_sample_size}" ]]; then
   BASE_ARGS+=( --intact_sample_size "${intact_sample_size}" )
-fi
-
-if [[ "${normalize_loss}" == "true" ]]; then
-  BASE_ARGS+=( --normalize_loss )
-else
-  BASE_ARGS+=( --no-normalize_loss )
 fi
 
 if [[ "${use_wandb}" == "true" ]]; then
@@ -257,6 +300,8 @@ fi
 echo "[INFO] Starting training in ${local_root} ..."
 cd "${local_root}"
 
+# -------- Launch training (capture status, don't exit early) --------
+set +e
 if $should_use_torchrun; then
   echo "[INFO] Launching torchrun with nproc_per_node=${nproc}"
   if command -v torchrun >/dev/null 2>&1; then
@@ -268,15 +313,44 @@ else
   echo "[INFO] Launching single-process training with python"
   python "${training_script}" "${BASE_ARGS[@]}"
 fi
+train_status=$?
+set -e
 
-echo "[INFO] Training completed."
-
-# -------- Local → GCS copy of artifacts --------
-if [[ -n "${model_save_gcs_uri}" ]]; then
-  echo "[INFO] Copying artifacts from ${local_model_save_dir} to ${model_save_gcs_uri}"
-  python "${transfer_script}" upload "${local_model_save_dir}" "${model_save_gcs_uri%/}"
+if [[ $train_status -eq 0 ]]; then
+  echo "[INFO] Training completed successfully (status=${train_status})."
 else
-  echo "[INFO] model_save_gcs_uri not set; skipping upload of artifacts."
+  echo "[ERROR] Training failed with status ${train_status}."
 fi
 
-echo "[INFO] intact_pretrain.sh finished successfully."
+# -------- Local → KFP artifact outputs --------
+copy_dir_to_output() {
+  local src="$1"
+  local dest="$2"
+  local label="$3"
+
+  if [[ -z "$dest" ]]; then
+    echo "[INFO] ${label} output path not set; skipping."
+    return 0
+  fi
+
+  if [[ ! -d "$src" ]]; then
+    echo "[WARN] ${label} source dir not found at ${src}; skipping copy."
+    return 0
+  fi
+
+  mkdir -p "$dest"
+  cp -R "${src}/." "$dest/"
+  echo "[INFO] ${label} copied to ${dest}"
+}
+
+copy_dir_to_output "${local_model_save_dir}/model" "${vertex_model_dir_path}" "Model artifacts"
+copy_dir_to_output "${local_model_save_dir}/metrics" "${vertex_metrics_dir_path}" "Metrics"
+copy_dir_to_output "${local_model_save_dir}/data_splits" "${vertex_data_splits_dir_path}" "Data splits"
+
+if [[ $train_status -eq 0 ]]; then
+  echo "[INFO] intact_pretrain.sh finished successfully."
+else
+  echo "[ERROR] intact_pretrain.sh exiting with non-zero status ${train_status}."
+fi
+
+exit "$train_status"

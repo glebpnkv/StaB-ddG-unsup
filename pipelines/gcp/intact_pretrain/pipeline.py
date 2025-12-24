@@ -1,6 +1,8 @@
 import logging
 import os
 from typing import Optional
+
+import google.auth
 from google_cloud_pipeline_components.v1.custom_job import (
     create_custom_training_job_from_component,
 )
@@ -14,10 +16,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_, project_id = google.auth.default()
+DEFAULT_LOCATION = "us-central1"
+
 BASE_IMAGE = os.environ.get("PIPELINE_BASE_IMAGE", "YOUR_ARTIFACT_REGISTRY_IMAGE_URI_HERE")
+BASE_OUTPUT_DIR = os.environ.get(
+    "PIPELINE_BASE_OUTPUT_DIR",
+    f"gs://stab-ddg-unsup-staging"
+)
 
 # Hard-coded hardware specs (set once here; not configurable at runtime)
-# MACHINE_TYPE = "n2-standard-64"  # testing
+# MACHINE_TYPE = "n2-standard-32"  # testing
 MACHINE_TYPE = "g2-standard-24"
 ACCELERATOR_TYPE = "NVIDIA_L4"
 ACCELERATOR_COUNT = 2
@@ -34,7 +43,6 @@ def intact_pretrain_training_step(
     model_ckpt_gcs_uri: Optional[str] = None,  # e.g. gs://bucket/model_ckpts (contains proteinmpnn.pt)
     # --- Training configuration ---
     run_name: str = "intact-pretrain",
-    model_save_gcs_uri: Optional[str] = None,  # e.g. gs://bucket/experiments/intact_pretrain
     max_length: int = 400,
     batch_size: int = 2,
     epochs: int = 5,
@@ -43,7 +51,8 @@ def intact_pretrain_training_step(
     k_pos: int = 5,
     k_neg: int = 5,
     noise_level: float = 0.1,
-    normalize_loss: bool = True,
+    lambda_sign: float = 10.0,
+    lambda_neutral: float = 0.0,
     valid_size: float = 0.1,
     test_size: float = 0.1,
     random_state: int = 42,
@@ -55,12 +64,12 @@ def intact_pretrain_training_step(
     # --- Outputs (Vertex artifacts) ---
     model_dir: Output[Artifact] = Output[Artifact],
     metrics_dir: Output[Dataset] = Output[Dataset],
+    data_splits_dir: Output[Dataset] = Output[Dataset],
 ) -> dsl.ContainerSpec:
     """
     Single-step container that delegates training to /app/scripts/intact_pretrain.sh.
     """
     model_ckpt_gcs_uri = model_ckpt_gcs_uri or ""
-    model_save_gcs_uri = model_save_gcs_uri or ""
 
     local_root = "/app"  # matches Dockerfile WORKDIR
 
@@ -71,7 +80,6 @@ def intact_pretrain_training_step(
         "--run_name", run_name,
         "--intact_data_gcs_uri", intact_data_gcs_uri,
         "--model_ckpt_gcs_uri", model_ckpt_gcs_uri,
-        "--model_save_gcs_uri", model_save_gcs_uri,
         "--local_root", local_root,
         "--max_length", str(max_length),
         "--batch_size", str(batch_size),
@@ -81,7 +89,8 @@ def intact_pretrain_training_step(
         "--k_pos", str(k_pos),
         "--k_neg", str(k_neg),
         "--noise_level", str(noise_level),
-        "--normalize_loss", str(normalize_loss).lower(),
+        "--lambda_sign", str(lambda_sign),
+        "--lambda_neutral", str(lambda_neutral),
         "--valid_size", str(valid_size),
         "--test_size", str(test_size),
         "--random_state", str(random_state),
@@ -90,9 +99,10 @@ def intact_pretrain_training_step(
         "--use_wandb", str(use_wandb).lower(),
         "--use_antithetic_variates", str(use_antithetic_variates).lower(),
         "--use_torchrun", "auto",
-        # Pass KFP artefact paths into the script so it can write URIs there
+        # Pass KFP artefact paths into the script so it can write outputs there
         "--vertex_model_dir_path", model_dir.path,
         "--vertex_metrics_dir_path", metrics_dir.path,
+        "--vertex_data_splits_dir_path", data_splits_dir.path,
     ]
 
     if intact_sample_size:
@@ -113,7 +123,8 @@ intact_pretrain_custom_job = create_custom_training_job_from_component(
     machine_type=MACHINE_TYPE,
     accelerator_type=ACCELERATOR_TYPE,
     accelerator_count=ACCELERATOR_COUNT,
-    timeout=JOB_TIMEOUT
+    timeout=JOB_TIMEOUT,
+    base_output_directory=BASE_OUTPUT_DIR,
 )
 
 
@@ -125,17 +136,18 @@ def intact_pretrain_pipeline(
     intact_data_gcs_uri: str,
     model_ckpt_gcs_uri: Optional[str] = None,
     run_name: str = "intact-pretrain",
-    model_save_gcs_uri: Optional[str] = None,
+    service_account: str = "",
     # training hyperparams (overridable at submission)
-    max_length: int = 256,
-    batch_size: int = 4,
+    max_length: int = 400,
+    batch_size: int = 2,
     epochs: int = 5,
     lr: float = 1e-3,
-    k_neutral: int = 32,
-    k_pos: int = 16,
-    k_neg: int = 16,
+    k_neutral: int = 20,
+    k_pos: int = 5,
+    k_neg: int = 5,
     noise_level: float = 0.1,
-    normalize_loss: bool = True,
+    lambda_sign: float = 10.0,
+    lambda_neutral: float = 0.0,
     valid_size: float = 0.1,
     test_size: float = 0.1,
     random_state: int = 42,
@@ -144,6 +156,7 @@ def intact_pretrain_pipeline(
     use_antithetic_variates: bool = True,
     use_wandb: bool = False,
     intact_sample_size: Optional[int] = None,
+    tensorboard: Optional[str] = None,
 ):
     """
     Single-step pipeline wrapping the multi-GPU IntAct pretraining job.
@@ -158,7 +171,6 @@ def intact_pretrain_pipeline(
         intact_data_gcs_uri=intact_data_gcs_uri,
         model_ckpt_gcs_uri=model_ckpt_gcs_uri,
         run_name=run_name,
-        model_save_gcs_uri=model_save_gcs_uri,
         max_length=max_length,
         batch_size=batch_size,
         epochs=epochs,
@@ -167,7 +179,8 @@ def intact_pretrain_pipeline(
         k_pos=k_pos,
         k_neg=k_neg,
         noise_level=noise_level,
-        normalize_loss=normalize_loss,
+        lambda_sign=lambda_sign,
+        lambda_neutral=lambda_neutral,
         valid_size=valid_size,
         test_size=test_size,
         random_state=random_state,
@@ -176,9 +189,12 @@ def intact_pretrain_pipeline(
         use_antithetic_variates=use_antithetic_variates,
         use_wandb=use_wandb,
         intact_sample_size=intact_sample_size,
+        tensorboard=tensorboard,
+        service_account=service_account
     )
 
     train_task.set_retry(
         num_retries=NUM_RETRIES,
         backoff_duration=BACKOFF_DURATION,
     )
+    train_task.set_display_name("StaB-ddG Intact Pre-Training")

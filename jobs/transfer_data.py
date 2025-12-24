@@ -31,7 +31,7 @@ def upload(args):
     final_prefix = os.path.join(prefix, dir_name)
 
     logger.info(f"Uploading from {args.src} to gs://{bucket}/{final_prefix}...")
-    upload_dir_to_gcp(bucket, args.src, final_prefix, region="europe-west4")
+    upload_dir_to_gcp(bucket, args.src, final_prefix, region=args.region)
 
 
 if __name__ == "__main__":
@@ -48,6 +48,7 @@ if __name__ == "__main__":
     p_up = subparsers.add_parser("upload")
     p_up.add_argument("src", help="Local source directory")
     p_up.add_argument("uri", help="Destination GCS URI (gs://...)")
+    p_up.add_argument("region", default="us-central1", help="Destination GCS region")
     p_up.set_defaults(func=upload)
 
     args = parser.parse_args()

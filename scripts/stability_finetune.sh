@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -------- Configuration (edit here) --------
+# -------- Defaults (overridable via CLI) --------
+# Run metadata
+run_name="stability-finetune"
+
 # Training args
 num_epochs=70
 batch_size=15000
-model_save_freq=2
-val_freq=2
+model_save_freq=10
+val_freq=10
+noise_level=0.1
+dropout=0.0
+lr=0.000001
 num_dataloader_workers=4
 
 # Data paths

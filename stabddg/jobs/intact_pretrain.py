@@ -166,24 +166,26 @@ def intact_pretrain(
     epochs: int = 5,
     lr: float = 1e-3,
     noise_level: float = 0.1,
-    normalize_loss: bool = True,
+    lambda_sign: float = 10.0,
+    lambda_neutral: float = 0.0,
     valid_size: float = 0.1,
     test_size: float = 0.1,
     random_state: int = 42,
     num_dataloader_workers: int = 1,
     model_val_freq: int = 5,
     use_antithetic_variates: bool = True,
-    model_existing_checkpoint: str = None,
+    model_existing_checkpoint: Optional[str] = None,
     use_wandb: bool = False,
     intact_sample_size: Optional[int] = None,
 ):
     # Resolve local_rank from env when launched via torchrun
+    local_rank = None
     env_local_rank = os.environ.get("LOCAL_RANK")
     if env_local_rank is not None:
         try:
             local_rank = int(env_local_rank)
         except ValueError:
-            local_rank == -1
+            local_rank = -1
 
     logger.info(
         f"local_rank (arg): {local_rank}, "
@@ -298,8 +300,9 @@ def intact_pretrain(
         save_dir=model_save_dir,
         batch_size=batch_size,
         num_dataloader_workers=num_dataloader_workers,
+        lambda_sign=lambda_sign,
+        lambda_neutral=lambda_neutral,
         n_epochs=epochs,
         model_val_freq=model_val_freq,
-        normalize_loss=normalize_loss,
-        lr=lr
+        lr=lr,
     )
