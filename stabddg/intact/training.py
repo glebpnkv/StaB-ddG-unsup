@@ -256,6 +256,7 @@ def pretrain(
     batch_size: int = 4,
     num_dataloader_workers: int = 1,
     lr: float = 1e-4,
+    lambda_supcon: float = 1.0,
     lambda_sign: float = 10.0,
     lambda_neutral: float = 0.0,
     n_epochs: int = 10,
@@ -266,6 +267,7 @@ def pretrain(
 ):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = ContrastiveLoss(
+        lambda_supcon=lambda_supcon,
         lambda_sign=lambda_sign,
         lambda_neutral=lambda_neutral,
     )

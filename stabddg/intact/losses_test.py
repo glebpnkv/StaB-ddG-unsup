@@ -4,10 +4,11 @@ import time
 import numpy as np
 import pandas as pd
 import torch
+from accelerate import Accelerator
 from torch.utils.data import Dataset, IterableDataset, get_worker_info, DataLoader
 from tqdm.auto import tqdm
 
-from stabddg.intact.losses import ContrastiveLoss
+from stabddg.intact.losses import ContrastiveLoss, ContrastiveLossOld
 
 
 class RegressionModel(torch.nn.Module):
@@ -193,6 +194,8 @@ def generate_synth_data(
         "sign"
     ] = -1
 
+    print(beta)
+
     return df_synth, x
 
 
@@ -212,52 +215,67 @@ def passthrough_collate_fn(x):
     return x[0]
 
 
-def train(
-    n: int = 5000,
-    k: int = 3,
-    seed: int | None = None,
+def _train(
+    df_synth: pd.DataFrame,
+    x: np.ndarray,
+    model: RegressionModel,
     k_neutral: int = 16,
     k_pos: int = 8,
     k_neg: int = 8,
     batch_size: int = 64,
     n_epochs: int = 10,
     lr: float = 1e-3,
+    lambda_supcon: float = 1.0,
     lambda_sign: float = 0.0,
     lambda_neutral: float = 0.0,
-):
-    # Generate synthetic data
-    df_synth, x = generate_synth_data(n=n, k=k, seed=seed)
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    # Device
+    accelerator = Accelerator()
+    device = accelerator.device
 
+    model = model.to(device)
     # Initialize dataset and model
     ds = SynthDataset(x, df_synth, k_neutral=k_neutral, k_pos=k_pos, k_neg=k_neg)
     ds_contrastive = SynthContrastiveStream(ds)
+
+    pin_mem = (accelerator.device.type == "cuda")  # False on mps/cpu
 
     dl = DataLoader(
         ds,
         batch_size=batch_size,
         shuffle=True,
         collate_fn=synth_collate_fn,
-        pin_memory=True,
+        pin_memory=pin_mem,
     )
     dl_contrastive = DataLoader(
         ds_contrastive,
         batch_size=1,
         shuffle=False,
-        pin_memory=True,
+        pin_memory=pin_mem,
         collate_fn=passthrough_collate_fn,
     )
 
-    model = RegressionModel(k)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = ContrastiveLoss(
+        lambda_supcon=lambda_supcon,
         lambda_sign=lambda_sign,
         lambda_neutral=lambda_neutral,
     )
+    # loss_fn = ContrastiveLossOld(
+    #     lambda_supcon=lambda_supcon,
+    #     lambda_sign=lambda_sign,
+    #     lambda_neutral=lambda_neutral
+    # )
 
-    all_train_metrics = None
+    df_metrics = None
     df_forecasts = pd.DataFrame()
+    model, optimizer, dl, dl_contrastive = accelerator.prepare(model, optimizer, dl, dl_contrastive)
 
-    for epoch in tqdm(range(n_epochs), desc="Epoch"):
+    pbar_epoch = tqdm(range(n_epochs), desc="Epoch", leave=False)
+
+    for epoch in pbar_epoch:
+        pbar_epoch.set_description(f"Epoch {epoch + 1}")
+
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
@@ -266,9 +284,10 @@ def train(
         df_forecasts_epoch = pd.DataFrame()
 
         contrast_iter = iter(dl_contrastive)
-        pbar = tqdm(dl, desc=f"Epoch {epoch + 1}", leave=False)
+        # pbar = tqdm(dl, desc=f"Epoch {epoch + 1}", leave=False)
 
-        for i, batch in enumerate(pbar):
+        # for i, batch in enumerate(pbar):
+        for i, batch in enumerate(dl):
             # Refresh contrastive iterator if exhausted
             try:
                 batch_contrast = next(contrast_iter)
@@ -291,12 +310,13 @@ def train(
                 z_neu=z_neu,
             )
 
-            loss.backward()
+            # loss.backward()
+            accelerator.backward(loss)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
             # Progress bar
-            pbar.set_postfix(metrics)
+            # pbar.set_postfix(metrics)
 
             # Running mean of metrics
             if all_train_metrics is None:
@@ -320,14 +340,58 @@ def train(
         df_forecasts_epoch["split"] = "Train"
         df_forecasts = pd.concat([df_forecasts, df_forecasts_epoch], ignore_index=True)
 
+        df_metrics_cur = pd.DataFrame({"epoch": epoch + 1} | all_train_metrics, index=[0])
+        df_metrics = pd.concat([df_metrics, df_metrics_cur], ignore_index=True)
+
         # Print epoch-level aggregates
         if all_train_metrics:
+            pbar_epoch.set_postfix(all_train_metrics)
             tqdm.write(
                 f'Epoch {epoch + 1}: '
                 f'{ {k: f"{v:.4f}" for k, v in all_train_metrics.items() if v is not None} }'
             )
 
-    return all_train_metrics, df_forecasts
+    # Adding run's key hyperparameters to df_metrics
+    df_metrics["lambda_supcon"] = lambda_supcon
+    df_metrics["lambda_sign"] = lambda_sign
+    df_metrics["lr"] = lr
+
+    return df_metrics, df_forecasts
+
+
+def train(
+    n: int = 100,
+    k: int = 3,
+    seed: int | None = None,
+    k_neutral: int = 16,
+    k_pos: int = 8,
+    k_neg: int = 8,
+    batch_size: int = 64,
+    n_epochs: int = 500,
+    lr: float = 1e-2,
+    lambda_sign: float = 5.0,
+    lambda_neutral: float = 0.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+
+    # Generate synthetic data
+    df_synth, x = generate_synth_data(n=n, k=k, seed=seed)
+    model = RegressionModel(k)
+
+    df_metrics, df_forecasts = _train(
+        df_synth,
+        x,
+        model,
+        k_neutral=k_neutral,
+        k_pos=k_pos,
+        k_neg=k_neg,
+        batch_size=batch_size,
+        n_epochs=n_epochs,
+        lr=lr,
+        lambda_sign=lambda_sign,
+        lambda_neutral=lambda_neutral,
+    )
+
+    return df_metrics, df_forecasts
 
 
 if __name__ == "__main__":

@@ -24,6 +24,8 @@ BASE_OUTPUT_DIR = os.environ.get(
     "PIPELINE_BASE_OUTPUT_DIR",
     f"gs://stab-ddg-unsup-staging"
 )
+PIPELINE_SERVICE_ACCOUNT = os.environ.get("PIPELINE_SERVICE_ACCOUNT", "")
+PIPELINE_TENSORBOARD_RESOURCE_NAME = os.environ.get("PIPELINE_TENSORBOARD_RESOURCE_NAME")
 
 # Hard-coded hardware specs (set once here; not configurable at runtime)
 # MACHINE_TYPE = "n2-standard-32"  # testing
@@ -31,7 +33,7 @@ MACHINE_TYPE = "g2-standard-24"
 ACCELERATOR_TYPE = "NVIDIA_L4"
 ACCELERATOR_COUNT = 2
 
-JOB_TIMEOUT = "86400s"   # 1 day
+JOB_TIMEOUT = "259200s"   # 3 days
 NUM_RETRIES = 0
 BACKOFF_DURATION = "600s"   # 10 minutes
 
@@ -125,6 +127,8 @@ intact_pretrain_custom_job = create_custom_training_job_from_component(
     accelerator_count=ACCELERATOR_COUNT,
     timeout=JOB_TIMEOUT,
     base_output_directory=BASE_OUTPUT_DIR,
+    service_account=PIPELINE_SERVICE_ACCOUNT,
+    tensorboard=PIPELINE_TENSORBOARD_RESOURCE_NAME,
 )
 
 
@@ -136,7 +140,6 @@ def intact_pretrain_pipeline(
     intact_data_gcs_uri: str,
     model_ckpt_gcs_uri: Optional[str] = None,
     run_name: str = "intact-pretrain",
-    service_account: str = "",
     # training hyperparams (overridable at submission)
     max_length: int = 400,
     batch_size: int = 2,
@@ -156,7 +159,6 @@ def intact_pretrain_pipeline(
     use_antithetic_variates: bool = True,
     use_wandb: bool = False,
     intact_sample_size: Optional[int] = None,
-    tensorboard: Optional[str] = None,
 ):
     """
     Single-step pipeline wrapping the multi-GPU IntAct pretraining job.
@@ -189,8 +191,6 @@ def intact_pretrain_pipeline(
         use_antithetic_variates=use_antithetic_variates,
         use_wandb=use_wandb,
         intact_sample_size=intact_sample_size,
-        tensorboard=tensorboard,
-        service_account=service_account
     )
 
     train_task.set_retry(

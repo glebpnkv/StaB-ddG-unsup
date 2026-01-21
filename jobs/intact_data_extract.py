@@ -23,7 +23,7 @@ def main():
     parser.add_argument("--gcp-download", action="store_true", help="Download the intact data dir from GCP before splitting")
     parser.add_argument("--gcp-bucket", default="stab-ddg-unsup", help="GCP bucket name")
     parser.add_argument("--gcp-prefix", default="data/intact", help="Destination/prefix within the bucket")
-    parser.add_argument("--gcp-region", default="europe-west4", help="GCP region for uploads")
+    parser.add_argument("--gcp-region", default="us-central1", help="GCP region for uploads")
 
     args = parser.parse_args()
 

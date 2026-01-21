@@ -5,7 +5,7 @@ from google_cloud_pipeline_components.v1.custom_job import (
     create_custom_training_job_from_component,
 )
 from kfp import dsl
-from kfp.dsl import Output, Dataset, Artifact
+from kfp.dsl import Output, Dataset
 
 # Configure logging
 logging.basicConfig(
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 BASE_IMAGE = os.environ.get("PIPELINE_BASE_IMAGE", "YOUR_ARTIFACT_REGISTRY_IMAGE_URI_HERE")
 
 # Hard-coded hardware specs (set once here; not configurable at runtime)
-# MACHINE_TYPE = "n2-standard-64"  # testing
+# MACHINE_TYPE = "n2-standard-32"  # testing
 MACHINE_TYPE = "g2-standard-12"
 ACCELERATOR_TYPE = "NVIDIA_L4"
 ACCELERATOR_COUNT = 1
@@ -34,7 +34,6 @@ def skempi_eval_step(
     model_ckpt_gcs_uri: Optional[str] = None, # e.g. gs://bucket/path/to/single_checkpoint.pt
     # --- Evaluation configuration ---
     run_name: str = "skempi-eval",
-    output_gcs_uri: Optional[str] = None,     # e.g. gs://bucket/experiments/skempi_eval
     batch_size: int = 10000,
     ensemble: int = 20,
     noise_level: float = 0.1,
@@ -42,13 +41,11 @@ def skempi_eval_step(
     sample_size: Optional[int] = None,
     # --- Outputs (Vertex artifacts) ---
     predictions_dir: Output[Dataset] = Output[Dataset],
-    logs_dir: Output[Artifact] = Output[Artifact],
 ) -> dsl.ContainerSpec:
     """
     Single-step container that delegates SKEMPI evaluation to /app/scripts/skempi_eval.sh.
     """
     model_ckpt_gcs_uri = model_ckpt_gcs_uri or ""
-    output_gcs_uri = output_gcs_uri or ""
 
     local_root = "/app"  # matches Dockerfile WORKDIR
 
@@ -59,13 +56,14 @@ def skempi_eval_step(
         "--run_name", run_name,
         "--skempi_data_gcs_uri", skempi_data_gcs_uri,
         "--model_ckpt_gcs_uri", model_ckpt_gcs_uri,
-        "--output_gcs_uri", output_gcs_uri,
         "--local_root", local_root,
         "--batch_size", str(batch_size),
         "--ensemble", str(ensemble),
         "--noise_level", str(noise_level),
         "--seed", str(seed),
         "--use_torchrun", "auto",
+        # Pass KFP artefact paths into the script so it can write outputs there
+        "--vertex_predictions_dir_path", predictions_dir.path,
     ]
 
     # Optional: limit evaluation sample size for debugging
@@ -76,12 +74,10 @@ def skempi_eval_step(
     #
     # - predictions_dir: where the CSV predictions will end up after the script
     #   (we just expose the local_run_dir from skempi_eval.sh)
-    # - logs_dir: can point to the same path (or a subdirectory) if you want logs
     #
     # Note: the shell script itself controls what is placed under these paths; here
     # we simply expose the directory so that downstream pipeline steps can consume it.
     predictions_dir.path = os.path.join(local_root, "runs", "skempi_eval")
-    logs_dir.path = os.path.join(local_root, "runs", "skempi_eval")
 
     return dsl.ContainerSpec(
         image=BASE_IMAGE,
@@ -108,7 +104,6 @@ def skempi_eval_pipeline(
     skempi_data_gcs_uri: str,
     model_ckpt_gcs_uri: Optional[str] = None,
     run_name: str = "skempi-eval",
-    output_gcs_uri: Optional[str] = None,
     # evaluation hyperparams (overridable at submission)
     batch_size: int = 10000,
     ensemble: int = 20,
@@ -128,7 +123,6 @@ def skempi_eval_pipeline(
         skempi_data_gcs_uri=skempi_data_gcs_uri,
         model_ckpt_gcs_uri=model_ckpt_gcs_uri,
         run_name=run_name,
-        output_gcs_uri=output_gcs_uri,
         batch_size=batch_size,
         ensemble=ensemble,
         noise_level=noise_level,

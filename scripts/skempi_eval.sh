@@ -9,7 +9,7 @@ run_name="skempi-eval"
 # GCS locations (if empty, no GCS copy is attempted)
 skempi_data_gcs_uri=""
 model_ckpt_gcs_uri=""
-output_gcs_uri=""
+vertex_predictions_dir_path=""
 
 # Local root inside container / VM
 local_root="/app"
@@ -41,17 +41,17 @@ training_script="/app/jobs/skempi_eval.py"
 # -------- Argument parsing --------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --run_name)            run_name="${2:-$run_name}"; shift 2 ;;
-    --skempi_data_gcs_uri) skempi_data_gcs_uri="${2:-}"; shift 2 ;;
-    --model_ckpt_gcs_uri)  model_ckpt_gcs_uri="${2:-}"; shift 2 ;;
-    --output_gcs_uri)      output_gcs_uri="${2:-}"; shift 2 ;;
-    --local_root)          local_root="${2:-$local_root}"; shift 2 ;;
-    --batch_size)          batch_size="${2:-$batch_size}"; shift 2 ;;
-    --ensemble)            ensemble="${2:-$ensemble}"; shift 2 ;;
-    --noise_level)         noise_level="${2:-$noise_level}"; shift 2 ;;
-    --seed)                seed="${2:-$seed}"; shift 2 ;;
-    --sample_size)         sample_size="${2:-$sample_size}"; shift 2 ;;
-    --use_torchrun)        use_torchrun="${2:-$use_torchrun}"; shift 2 ;;
+    --run_name)                      run_name="${2:-$run_name}"; shift 2 ;;
+    --skempi_data_gcs_uri)           skempi_data_gcs_uri="${2:-}"; shift 2 ;;
+    --model_ckpt_gcs_uri)            model_ckpt_gcs_uri="${2:-}"; shift 2 ;;
+    --vertex_predictions_dir_path)   vertex_predictions_dir_path="${2:-}"; shift 2 ;;
+    --local_root)                    local_root="${2:-$local_root}"; shift 2 ;;
+    --batch_size)                    batch_size="${2:-$batch_size}"; shift 2 ;;
+    --ensemble)                      ensemble="${2:-$ensemble}"; shift 2 ;;
+    --noise_level)                   noise_level="${2:-$noise_level}"; shift 2 ;;
+    --seed)                          seed="${2:-$seed}"; shift 2 ;;
+    --sample_size)                   sample_size="${2:-$sample_size}"; shift 2 ;;
+    --use_torchrun)                  use_torchrun="${2:-$use_torchrun}"; shift 2 ;;
     *)
       echo "Unknown argument: $1" >&2
       exit 1
@@ -62,7 +62,7 @@ done
 echo "[INFO] run_name=${run_name}"
 echo "[INFO] skempi_data_gcs_uri=${skempi_data_gcs_uri}"
 echo "[INFO] model_ckpt_gcs_uri=${model_ckpt_gcs_uri}"
-echo "[INFO] output_gcs_uri=${output_gcs_uri}"
+echo "[INFO] vertex_predictions_dir_path=${vertex_predictions_dir_path}"
 echo "[INFO] local_root=${local_root}"
 
 # -------- Local paths derived from local_root --------
@@ -77,7 +77,7 @@ local_skempi_csv="${local_skempi_dir}/filtered_skempi.csv"
 local_skempi_split="${local_skempi_dir}/test_pdb.pkl"
 local_skempi_pdb_dir="${local_data_dir}/PDBs"
 local_skempi_pdb_cache="${local_cache_dir}/skempi_full_mask_pdb_dict.pkl"
-local_checkpoint="${local_ckpt_dir}/proteinmpnn.pt"
+checkpoint="${local_ckpt_dir}/proteinmpnn.pt"
 local_output_dir="${local_run_dir}"
 
 mkdir -p "${local_skempi_dir}" \
@@ -97,7 +97,7 @@ fi
 
 # model_ckpt_gcs_uri
 if [[ -n "${model_ckpt_gcs_uri}" ]]; then
-  echo "[INFO] Copying model checkpoint from GCS..."
+  echo "[INFO] Copying existing model checkpoint from GCS..."
   # Download into a temporary subdir under local_ckpt_dir to avoid collisions
   tmp_ckpt_dir="${local_ckpt_dir}/_download"
   mkdir -p "${tmp_ckpt_dir}"
@@ -117,18 +117,19 @@ if [[ -n "${model_ckpt_gcs_uri}" ]]; then
 
   if [[ -n "${downloaded_ckpt}" ]]; then
     echo "[INFO] Using downloaded checkpoint: ${downloaded_ckpt}"
-    # Overwrite the canonical local_checkpoint name so the rest of the script
+    # Overwrite the canonical checkpoint name so the rest of the script
     # always passes a stable path to jobs/skempi_eval.py
-    cp "${downloaded_ckpt}" "${local_checkpoint}"
+    cp "${downloaded_ckpt}" "${checkpoint}"
+    echo "[INFO] ${downloaded_ckpt} was renamed to ${checkpoint}"
   else
-    echo "[WARN] No .pt files found under ${tmp_ckpt_dir}; falling back to local ${local_checkpoint} if it exists."
+    echo "[WARN] No .pt files found under ${tmp_ckpt_dir}; falling back to local ${checkpoint} if it exists."
   fi
 fi
 
-if [[ -f "${local_checkpoint}" ]]; then
-  echo "[INFO] Using checkpoint: ${local_checkpoint}"
+if [[ -f "${checkpoint}" ]]; then
+  echo "[INFO] Using checkpoint: ${checkpoint}"
 else
-  echo "[WARN] Checkpoint ${local_checkpoint} not found; evaluation will fail unless checkpoint is provided elsewhere."
+  echo "[WARN] Checkpoint ${checkpoint} not found; evaluation will fail unless checkpoint is provided elsewhere."
 fi
 
 # -------- GPU detection --------
@@ -199,7 +200,7 @@ nproc="${NUM_GPUS}"
 # -------- Launch evaluation --------
 BASE_ARGS=(
   --run_name "${run_name}"
-  --checkpoint "${local_checkpoint}"
+  --checkpoint "${checkpoint}"
   --skempi_path "${local_skempi_csv}"
   --skempi_pdb_dir "${local_skempi_pdb_dir}"
   --skempi_pdb_cache_path "${local_skempi_pdb_cache}"
@@ -234,12 +235,27 @@ fi
 
 echo "[INFO] Evaluation completed."
 
-# -------- Local → GCS copy of artifacts --------
-if [[ -n "${output_gcs_uri}" ]]; then
-  echo "[INFO] Copying evaluation outputs from ${local_output_dir} to ${output_gcs_uri}"
-  python "${transfer_script}" upload "${local_output_dir}" "${output_gcs_uri%/}"
-else
-  echo "[INFO] output_gcs_uri not set; skipping upload of evaluation outputs."
-fi
+# -------- Local → KFP artifact outputs --------
+copy_dir_to_output() {
+  local src="$1"
+  local dest="$2"
+  local label="$3"
+
+  if [[ -z "$dest" ]]; then
+    echo "[INFO] ${label} output path not set; skipping."
+    return 0
+  fi
+
+  if [[ ! -d "$src" ]]; then
+    echo "[WARN] ${label} source dir not found at ${src}; skipping copy."
+    return 0
+  fi
+
+  mkdir -p "$dest"
+  cp -R "${src}/." "$dest/"
+  echo "[INFO] ${label} copied to ${dest}"
+}
+
+copy_dir_to_output "${local_output_dir}" "${vertex_predictions_dir_path}" "Predictions"
 
 echo "[INFO] skempi_eval.sh finished successfully."
