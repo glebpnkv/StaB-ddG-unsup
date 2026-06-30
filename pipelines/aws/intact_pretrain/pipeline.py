@@ -52,9 +52,11 @@ def build_pipeline() -> Pipeline:
     batch_size = ParameterInteger("BatchSize", default_value=2)
     max_length = ParameterInteger("MaxLength", default_value=400)
     lr = ParameterFloat("LearningRate", default_value=1e-3)
-    k_neutral = ParameterInteger("KNeutral", default_value=20)
-    k_pos = ParameterInteger("KPos", default_value=5)
-    k_neg = ParameterInteger("KNeg", default_value=5)
+    # Each step runs k_pos + k_neg + k_neutral separate ProteinMPNN forwards PER RANK, so these drive
+    # per-GPU memory. 4/4/8 fits an A10G (24 GB) at max_length=400; the GCP defaults (5/5/20) OOM it.
+    k_neutral = ParameterInteger("KNeutral", default_value=8)
+    k_pos = ParameterInteger("KPos", default_value=4)
+    k_neg = ParameterInteger("KNeg", default_value=4)
     lambda_sign = ParameterFloat("LambdaSign", default_value=0.0)
     lambda_neutral = ParameterFloat("LambdaNeutral", default_value=0.0)
     model_val_freq = ParameterInteger("ModelValFreq", default_value=5)
