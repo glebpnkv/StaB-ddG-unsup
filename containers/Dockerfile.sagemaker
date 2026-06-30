@@ -1,0 +1,19 @@
+# Image for SageMaker Processing (IntAct data extraction) and CPU jobs.
+# Training (GPU) uses an AWS Deep Learning Container base instead; see pipelines/aws/README.md.
+FROM python:3.10-slim
+
+WORKDIR /app
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# Build deps for native wheels (gemmi etc.)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the project (and its dependencies) into the image.
+COPY pyproject.toml ./
+COPY . .
+RUN python -m pip install --upgrade pip \
+    && python -m pip install -e .
