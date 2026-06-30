@@ -4,6 +4,7 @@ from typing import Optional
 
 import pandas as pd
 import torch
+import torch.distributed as dist
 import wandb
 from sklearn.model_selection import train_test_split
 
@@ -199,6 +200,17 @@ def intact_pretrain(
         f"WORLD_SIZE={os.environ.get('WORLD_SIZE')}"
     )
 
+    # Initialise the distributed process group when launched under torchrun (WORLD_SIZE > 1).
+    # Without this, dist.is_initialized() stays False, so DDP / DistributedSampler / metric
+    # all-reduce below never activate and every rank would train the full dataset uncoordinated.
+    world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+    if world_size > 1 and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+        if torch.cuda.is_available() and local_rank is not None and local_rank >= 0:
+            torch.cuda.set_device(local_rank)
+        logger.info(f"Initialized process group: backend={backend}, world_size={world_size}")
+
     # Getting the device
     device = get_device(local_rank=local_rank)
     logger.info(f"Using device: {device}")
@@ -317,3 +329,6 @@ def intact_pretrain(
         model_val_freq=model_val_freq,
         lr=lr,
     )
+
+    if dist.is_initialized():
+        dist.destroy_process_group()

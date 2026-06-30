@@ -1,0 +1,13 @@
+# GPU training image for SageMaker (IntAct multi-GPU pretrain).
+# Built on the AWS PyTorch training Deep Learning Container, which provides CUDA torch + the
+# sagemaker-training toolkit (managed torchrun). torch is an optional extra in pyproject.toml, so
+# `pip install -e .` only layers on the project's other dependencies, leaving the DLC's torch intact.
+ARG BASE_IMAGE=763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training:2.3.0-gpu-py311
+FROM ${BASE_IMAGE}
+
+WORKDIR /app
+ENV PIP_NO_CACHE_DIR=1
+
+COPY pyproject.toml ./
+COPY . .
+RUN pip install -e .

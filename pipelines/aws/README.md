@@ -5,8 +5,8 @@ The AWS counterpart of `pipelines/gcp/`. Same workloads, expressed with **SageMa
 
 | Pipeline | GCP equivalent | Status |
 |----------|----------------|--------|
-| `intact_data_extract` | `pipelines/gcp/intact_data_extract` | ✅ implemented |
-| `intact_pretrain` (multi-GPU training) | `pipelines/gcp/intact_pretrain` | ⏳ next |
+| `intact_data_extract` | `pipelines/gcp/intact_data_extract` | ✅ implemented + smoke-tested on SageMaker |
+| `intact_pretrain` (multi-GPU training) | `pipelines/gcp/intact_pretrain` | ✅ implemented (not yet run) |
 | `skempi_eval` | `pipelines/gcp/skempi_eval` | ⏳ planned |
 
 ## One-time setup
@@ -52,7 +52,32 @@ PrepareMutations → FetchAlphaFold → FilterMutations → FetchMetadata → Se
 - **Automatic lineage** — steps chain via ProcessingOutput→ProcessingInput, so SageMaker infers the
   DAG and records artifact lineage; the run is visible in Studio / SageMaker Pipelines.
 
+## Pretrain pipeline (multi-GPU)
+
+```bash
+# 1. Build the GPU training image (DLC base + project) and push as :gpu
+DOCKERFILE=containers/Dockerfile.sagemaker.gpu TAG=gpu ALIAS_TAG=gpu ./scripts/build_and_push/sagemaker.sh
+export PIPELINE_IMAGE_TAG=gpu
+
+# 2. Register + run (point --data-uri at an S3 prefix holding the intact/ layout:
+#    proteins/safetensors/, assemblies/safetensors/, df_intact_mutations_filtered.parquet, ...)
+python -m pipelines.aws.intact_pretrain.pipeline run --data-uri s3://<bucket>/<prefix>/intact
+```
+
+A single GPU `TrainingStep` on **`ml.g5.12xlarge`** (4× A10G) using SageMaker's managed
+`torch_distributed` (torchrun across the 4 GPUs — `jobs/intact_pretrain.py` initialises the process
+group and wraps the model in DDP), with TensorBoard synced to S3, model artifacts to
+`/opt/ml/model`, then a **`RegisterModel`** step that records the result in the SageMaker **Model
+Registry** (group `stab-ddg-intact-pretrain`).
+
+### SageMaker features used
+- Managed **multi-GPU** training (`distribution={"torch_distributed": {"enabled": True}}`).
+- **TensorBoard → S3** via `TensorBoardOutputConfig`.
+- **Model Registry** versioning with an approval gate (`ModelApprovalStatus`).
+
+> The training data channel expects a single S3 prefix with the `intact/` layout. The
+> data-extraction pipeline writes its stages to separate prefixes, so wiring its outputs into this
+> channel (a small consolidation step, or per-type channels) is the remaining integration task.
+
 ## Roadmap
-- `intact_pretrain`: `TrainingStep` on a GPU instance (`ml.g5.12xlarge`), multi-GPU via torchrun,
-  TensorBoard → S3, checkpoints to `OutputDataConfig`, model registered in the **Model Registry**.
 - `skempi_eval`: evaluation `ProcessingStep`/`TrainingStep` consuming the registered model.
