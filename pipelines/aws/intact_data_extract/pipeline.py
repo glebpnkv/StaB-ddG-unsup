@@ -77,6 +77,16 @@ def build_pipeline() -> Pipeline:
             destination=dest(step, channel),
         )
 
+    def published(*subparts: str):
+        # s3://<bucket>/<prefix>/training_data[/<subpart>...] — the consolidated, training-ready
+        # layout consumed directly by the pretrain pipeline's data channel (--data-uri).
+        return Join(on="/", values=["s3:/", bucket, prefix, "training_data", *subparts])
+
+    def out_published(channel: str, destination) -> ProcessingOutput:
+        return ProcessingOutput(
+            output_name=channel, source=f"{_CONTAINER_OUT}/{channel}", destination=destination
+        )
+
     def inp(channel: str, source) -> ProcessingInput:
         return ProcessingInput(
             input_name=channel, source=source, destination=f"{_CONTAINER_IN}/{channel}"
@@ -117,7 +127,7 @@ def build_pipeline() -> Pipeline:
                 inp("mutations", s3_out(prepare, "mutations")),
                 inp("step_outcome", s3_out(fetch_af, "step_outcome")),
             ],
-            outputs=[out("filtered", "filter_mutations")],
+            outputs=[out_published("filtered", published())],
             arguments=["--step", "filter_mutations"],
         ),
         cache_config=cache,
@@ -154,8 +164,8 @@ def build_pipeline() -> Pipeline:
             code=RUN_STEP,
             inputs=[inp("assemblies", s3_out(select, "assemblies"))],
             outputs=[
-                out("assemblies_atoms", "fetch_atoms"),
-                out("assemblies_filtered", "fetch_atoms"),
+                out_published("assemblies_atoms", published("assemblies")),
+                out_published("assemblies_filtered", published()),
             ],
             arguments=["--step", "fetch_atoms", "--max-workers", assemblies_workers.to_string()],
         ),
