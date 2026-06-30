@@ -121,12 +121,16 @@ class IntactDataset(Dataset):
         k_neutral: int = 32,
         k_pos: int = 4,
         k_neg: int = 4,
+        validate_wt: bool = True,
     ):
         self.proteins_dir = proteins_dir
         self.assemblies_dir = assemblies_dir
         self.k_neutral = k_neutral
         self.k_pos = k_pos
         self.k_neg = k_neg
+
+        # Cache of loaded structures (needed by the WT-consistency check below as well as training).
+        self.structures_cache = {}
 
         # Reading the metadata dataframe
         df = pd.read_parquet(df_intact_path)
@@ -144,16 +148,35 @@ class IntactDataset(Dataset):
             f"{len_raw - len_filtered} rows were removed)"
         )
 
-        # Separating intact data into +ve, -ve and neutrals; +ve impact means negative ddG - hence the sign will
-        # become -ve
+        # WT-consistency filter. The mapping from a UniProt mutation position to a residue in the
+        # experimental assembly is imperfect: ~25% of annotated positions are simply not resolved in
+        # the structure (and a few are mis-numbered). Training on those would silently apply the
+        # mutation to the wrong residue (or not at all), yielding a ~zero-ΔΔG anchor with a confident
+        # sign label. We therefore drop every row whose wild-type residue(s) at the mapped position do
+        # not match IntAct's `original_sequence`. This is the correctness guarantee that complements
+        # the alignment-based numbering in stabddg/intact/data.py.
+        if validate_wt:
+            keep = df.apply(self._wt_consistent, axis=1)
+            n_drop = int((~keep).sum())
+            df = df.loc[keep].reset_index(drop=True)
+            logger.info(
+                f"WT-consistency filter: kept {len(df)} / {len_filtered} rows "
+                f"({n_drop} dropped where the structure WT did not match IntAct's original_sequence)"
+            )
+
+        # Separating intact data into +ve, -ve and neutrals.
+        # Sign convention follows the model / paper (StaB-ddG, arXiv:2507.05502, eqs 3-6) and is
+        # validated empirically against SKEMPI (pearson(ddG, model pred) = +0.51):
+        #   positive ddG = stabilizing / stronger binding, negative ddG = destabilizing / weaker binding.
+        # Hence an interaction-*increasing* mutation has sign +1 and a *decreasing*/disrupting one has sign -1.
         self.df_pos = df.loc[
             df["feature_type"].isin(self.feature_type_pos)
         ].copy()
-        self.df_pos["sign"] = -1
+        self.df_pos["sign"] = 1
         self.df_neg = df.loc[
             df["feature_type"].isin(self.feature_type_neg)
         ].copy()
-        self.df_neg["sign"] = 1
+        self.df_neg["sign"] = -1
         self.df_neutral = df.loc[
             df["feature_type"].isin(self.feature_type_neutral)
         ].copy()
@@ -162,9 +185,6 @@ class IntactDataset(Dataset):
 
         # Making an index of datapoints for sampling
         self.df_idx = pd.concat([self.df_pos, self.df_neg])["feature_type"]
-
-        # Creating a cache of structures
-        self.structures_cache = {}
 
     def __len__(self):
         return len(self.df_idx)
@@ -201,29 +221,43 @@ class IntactDataset(Dataset):
         self.structures_cache[name] = out
         return self.structures_cache[name]
 
-    def _load_protein_full(self, name: str):
-        """
-        Load protein structure from cache or disk.
-        """
-        # Loading structures from cache if they exist
-        if name in self.structures_cache.keys():
-            return self.structures_cache[name]
+    def _wt_consistent(self, sample: pd.Series) -> bool:
+        """Whether the wild-type residue(s) at the mutation's mapped position in the assembly match
+        IntAct's ``original_sequence``.
 
-        # Loading proteins from the disk
-        f = safe_open(os.path.join(self.proteins_dir, f"{name}.safetensors"), framework="pt", device="cpu")
-        metadata = f.metadata()
-        structure = {}
-        for key in f.keys():
-            # TODO It's wasteful to convert tensors back to numpy arrays, but it makes _combine_items simpler
-            structure[key] = f.get_tensor(key).numpy()
+        Returns False when the affected chain is missing, the position is not resolved in the
+        structure, or the numbering disagrees — i.e. exactly the rows where the mutation cannot be
+        applied correctly and which would otherwise become mislabeled ~zero-ΔΔG anchors.
+        """
+        try:
+            cmplex = self._load_assembly(sample["biological_assembly"])
+        except Exception:
+            return False
 
-        # Adding to cache
-        out = {
-            "metadata": metadata,
-            "data": structure,
-        }
-        self.structures_cache[name] = out
-        return self.structures_cache[name]
+        metadata = cmplex["metadata"]
+        data = cmplex["data"]
+
+        # chain-encoding id -> protein accession (mirrors _make_mutation_sequence)
+        enc = {x.strip("chain_encoding:"): v for x, v in metadata.items() if "chain_encoding" in x}
+        enc = {int(k): metadata.get(v) for k, v in enc.items()}
+        ids = [cid for cid, prot in enc.items() if prot == sample["affected_protein_ac"]]
+        if not ids:
+            return False
+
+        chain_enc = data["chain_encoding_all"].astype(np.int32)
+        resnums = data["resnums"].astype(np.int32)
+        S = data["S"]
+        start = int(sample["feature_ranges_start"])
+        end = int(sample["feature_ranges_end"])
+        orig = str(sample["original_sequence"])
+
+        # The affected protein may occupy multiple chain copies; accept if any copy matches.
+        for cid in ids:
+            cidx = np.flatnonzero(chain_enc == cid)
+            sel = cidx[(resnums[cidx] >= start) & (resnums[cidx] < end)]
+            if "".join(ALPHABET[int(i)] for i in S[sel]) == orig:
+                return True
+        return False
 
     def _make_mutation_sequence(
         self,
@@ -273,29 +307,27 @@ class IntactDataset(Dataset):
         if not in_range.any():
             return S
 
-        # Find contiguous runs in the boolean mask 'in_range' over aff_idx
-        # We only expect one range per sample, but this works for multiples as well
-        runs_start = np.flatnonzero(in_range & (~np.roll(in_range, 1)))
-        runs_end = np.flatnonzero(in_range & (~np.roll(in_range, -1))) + 1  # exclusive
-        if in_range[0]:
-            runs_start[0] = 0
-        if in_range[-1]:
-            runs_end[-1] = in_range.size - 1
-
-        # Map runs in aff array back to absolute S indices
-        idx_mut_start = aff_idx[runs_start]
-        idx_mut_end = aff_idx[runs_end]  # make exclusive in S coordinates
+        # Absolute S indices of the in-range affected residues (one contiguous block per chain copy;
+        # may be several blocks if the affected protein occupies multiple chains, e.g. a homomer).
+        sel = aff_idx[in_range]
+        if sel.size == 0:
+            return S
 
         # Replacement payload ('.' means deletion → remove completely)
         repl_str = str(sample["resulting_sequence"]).replace(SEQUENCE_DELETION, "")
         repl_vals = self._fetch_sequence(repl_str) if repl_str else np.asarray([], dtype=np.int32)
 
-        # Splice iteratively over ranges: S[:s0] + repl + S[e0:s1] + repl + ... + S[e_last:]
+        # Group the selected indices into contiguous runs in S-coordinate space and splice each run.
+        # Working in S coordinates (rather than aff-array coordinates) makes the exclusive end
+        # run[-1] + 1 always valid — including when the range touches the chain terminus.
+        breaks = np.flatnonzero(np.diff(sel) != 1) + 1
+        runs = np.split(sel, breaks)
+
         parts = []
         prev = 0
-        for i in range(len(idx_mut_start)):
-            s_i = int(idx_mut_start[i])
-            e_i = int(idx_mut_end[i])  # exclusive
+        for run in runs:
+            s_i = int(run[0])
+            e_i = int(run[-1]) + 1  # exclusive in S coordinates
             if prev < s_i:
                 parts.append(S[prev:s_i])
             parts.append(repl_vals)
@@ -320,31 +352,6 @@ class IntactDataset(Dataset):
 
         # Preparing output
         out = cmplex["data"] | {"mut_seqs": complex_mut_seqs, "max_length": max_length}
-
-        return out
-
-    def _fetch_binders_full(self, idx):
-        """
-        Fetch a pair of complete binders for a single complex in the dataset.
-        """
-        # A sample is a single row from the DataFrame
-        sample = self.df.loc[idx]
-
-        # Getting names of the proteins
-        name_binder_1 = sample["participant_protein"]
-        name_binder_2 = sample["affected_protein_ac"]
-
-        binder1 = self._load_protein_full(name_binder_1)
-        binder2 = self._load_protein_full(name_binder_2)
-        # Making the mutation sequence
-        binder2_mut_seqs = self._make_mutation_sequence(binder2, sample)
-
-        out = {
-            "binder1": binder1.get("data"),
-            "binder2": binder2.get("data"),
-            "binder1_mut_seqs": binder1.get("data").get("S"),
-            "binder2_mut_seqs": binder2_mut_seqs,
-        }
 
         return out
 
@@ -416,7 +423,6 @@ class IntactDataset(Dataset):
 
     def _fetch(self, idx):
         out_complex = self._fetch_complex(idx)
-        # out_binders = self._fetch_binders_full(idx)
         out_binders = self._fetch_binders(idx)
 
         out = {"complex": out_complex} | out_binders
@@ -560,6 +566,7 @@ class IntactContrastiveStream(IterableDataset):
         step = 0
         while True:
             # Produce one contrastive batch by calling the existing sampler
+            # TODO: check if this is correct: pos and neg should depend on the sign of the anchor
             pos, neg, neutral = self.ds._sample()
             yield {"positive": pos, "negative": neg, "neutral": neutral}
 

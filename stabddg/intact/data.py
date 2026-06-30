@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import requests
 import torch
+from Bio import Align
 from rcsbapi.data import DataQuery
 from rcsbapi.model import ModelQuery
 from rcsbapi.search import AttributeQuery, NestedAttributeQuery
@@ -20,6 +21,7 @@ from safetensors.torch import save_file
 from tqdm import tqdm
 from urllib3.util.retry import Retry
 
+from stabddg.intact.uniprot import fetch_uniprot_sequences
 from stabddg.constants import (
     AA3_TO_1,
     ALPHABET,
@@ -754,88 +756,94 @@ def download_assembly_cif(assembly_key: str) -> str:
     return out
 
 
-def fetch_sifts_segments(pdb_id: str, timeout: int = 60) -> dict[str, list[dict]]:
+def _build_uniprot_aligner() -> Align.PairwiseAligner:
+    aligner = Align.PairwiseAligner()
+    aligner.mode = "global"
+    aligner.match_score = 2.0
+    aligner.mismatch_score = -1.0
+    # Gaps must be cheap: an observed structure chain is the canonical sequence with residues *missing*
+    # (unresolved loops/termini), so skipping a stretch of canonical should cost far less than forcing
+    # mismatches. Harsh gap penalties make the aligner shift-and-mismatch instead of gapping, which
+    # mis-registers everything downstream of a missing loop.
+    aligner.open_gap_score = -2.0
+    aligner.extend_gap_score = -0.1
+    # The observed chain is usually a sub-fragment of the full canonical sequence, so the ends of the
+    # canonical (target) and observed (query) sequences may gap freely without penalty.
+    aligner.target_end_gap_score = 0.0
+    aligner.query_end_gap_score = 0.0
+    return aligner
+
+
+def assign_uniprot_positions_by_alignment(
+    observed_seq: str,
+    canonical_seq: str,
+    aligner: Align.PairwiseAligner | None = None,
+) -> np.ndarray:
+    """Assign each residue of ``observed_seq`` its 1-based position in ``canonical_seq`` via global
+    sequence alignment.
+
+    Returns an int array of length ``len(observed_seq)``; residues that do not align to any canonical
+    position (insertions / engineered residues absent from the reference) are -1.
+
+    This is the robust replacement for SIFTS label-number arithmetic (``add_uniprot_from_sifts``),
+    which silently misaligns when applied to biological assemblies: the SIFTS bounds describe the
+    deposited entry, but gemmi re-assigns ``label_seq`` on the assembly, so the offset is wrong by a
+    different amount per structure. Aligning the observed sequence directly to the canonical UniProt
+    sequence sidesteps all numbering systems and also tolerates isoform gaps.
     """
-    Uses https://www.ebi.ac.uk/pdbe/api/v2/mappings/uniprot/{pdb_id}
-    Returns: { chain: [ {acc, start_label, end_label, unp_start}, ... ] }
-    (Segments without label bounds are skipped intentionally.)
-    """
-    pid = pdb_id.lower().strip()
-    url = f"https://www.ebi.ac.uk/pdbe/api/v2/mappings/uniprot/{pid}"
-    j = requests.get(url, timeout=timeout).json()
-    uni = (j.get(pid) or {}).get("UniProt") or {}
+    n = len(observed_seq)
+    positions = np.full(n, -1, dtype=np.int64)
+    if n == 0 or not canonical_seq:
+        return positions
 
-    out: dict[str, list[dict]] = {}
-    for acc, info in uni.items():
-        for m in info.get("mappings", []) or []:
-            chain = (m.get("struct_asym_id") or "").strip()
-            if not chain:
-                continue
-            s, e = m.get("start") or {}, m.get("end") or {}
-            # keep only segments that provide SEQRES/label bounds
-            if not (
-                isinstance(s.get("residue_number"), int)
-                and isinstance(e.get("residue_number"), int)
-            ):
-                continue
-            unp_s = m.get("unp_start")
-            if not isinstance(unp_s, int):
-                continue
-            out.setdefault(chain, []).append(
-                {
-                    "acc": acc,
-                    "start_label": int(s["residue_number"]),
-                    "end_label": int(e["residue_number"]),
-                    "unp_start": int(unp_s),
-                }
-            )
-    return out
+    aligner = aligner or _build_uniprot_aligner()
+    # target = canonical (reference), query = observed (structure chain)
+    alignment = aligner.align(canonical_seq, observed_seq)[0]
+    target_blocks, query_blocks = alignment.aligned  # gap-free aligned blocks
+    for (t0, _t1), (q0, q1) in zip(target_blocks, query_blocks):
+        length = q1 - q0
+        # within a gap-free block, target and query advance together
+        positions[q0:q1] = np.arange(t0, t0 + length, dtype=np.int64) + 1  # 1-based UniProt
+    return positions
 
 
-def add_uniprot_from_sifts(
-    df_atoms: pd.DataFrame, segs_by_chain: dict[str, list[dict]]
+def add_uniprot_by_alignment(
+    df_atoms: pd.DataFrame,
+    chain_to_acc: dict[str, str],
+    canonical_by_acc: dict[str, str | None],
+    aligner: Align.PairwiseAligner | None = None,
 ) -> pd.DataFrame:
+    """Assign ``resnum_uniprot`` to every atom by aligning each chain's observed residue sequence to
+    the canonical UniProt sequence of the protein mapped to that chain.
+
+    This is the robust replacement for ``add_uniprot_from_sifts``: it relies only on the residue
+    *sequence* (not on label/auth numbering that biological assemblies re-write), so it is immune to
+    assembly renumbering and naturally absorbs expression tags / cloning artefacts at the termini as
+    unaligned residues. Residues with no canonical counterpart get ``NaN``.
     """
-    Minimal, label-only application:
-    For each segment on a chain, set:
-      uniprot_pos = unp_start + (resnum_label - start_label)
-    for rows with start_label <= resnum_label <= end_label.
-    Never sorts, never drops, never adds temp columns.
-    """
-    if df_atoms.empty:
-        out = df_atoms.copy()
-        out["uniprot_acc"] = None
-        out["resnum_uniprot"] = np.nan
+    out = df_atoms.copy()
+    out["resnum_uniprot"] = np.nan
+    if out.empty:
         return out
 
-    df = df_atoms.copy()
-    if "uniprot_acc" not in df.columns:
-        df["uniprot_acc"] = None
-    if "resnum_uniprot" not in df.columns:
-        df["resnum_uniprot"] = np.nan
-
-    # ensure resnum_label is numeric for arithmetic; leave NaNs untouched
-    reslab = pd.to_numeric(df["resnum_label"], errors="coerce")
-
-    for chain, segs in (segs_by_chain or {}).items():
-        if not segs:
+    aligner = aligner or _build_uniprot_aligner()
+    for chain, sub in out.groupby("chain", sort=False):
+        acc = chain_to_acc.get(chain)
+        canonical = canonical_by_acc.get(acc) if acc else None
+        if not canonical:
             continue
-        chain_mask = df["chain"] == chain
-        if not chain_mask.any():
-            continue
-        for seg in segs:
-            s_lbl = seg["start_label"]
-            e_lbl = seg["end_label"]
-            up0 = seg["unp_start"]
-            # mask rows in this chain within the label range
-            m = chain_mask & reslab.ge(s_lbl) & reslab.le(e_lbl)
-            if not m.any():
-                continue
-            # compute uniprot_pos from label offset
-            df.loc[m, "uniprot_acc"] = seg["acc"]
-            df.loc[m, "resnum_uniprot"] = up0 + (reslab[m] - s_lbl).astype("Int64")
+        # Order residues N->C. Prefer label numbering; fall back to author numbering.
+        order_col = "resnum_label" if sub["resnum_label"].notna().any() else "resnum_auth"
+        res = sub.dropna(subset=[order_col]).drop_duplicates(subset=[order_col]).sort_values(order_col)
+        observed = "".join(res["res_name_1"].tolist())
+        positions = assign_uniprot_positions_by_alignment(observed, canonical, aligner=aligner)
+        pos_by_resnum = {
+            rn: (int(p) if p > 0 else np.nan)
+            for rn, p in zip(res[order_col].tolist(), positions)
+        }
+        out.loc[sub.index, "resnum_uniprot"] = sub[order_col].map(pos_by_resnum)
 
-    return df
+    return out
 
 
 def _write_assemblies_safetensors(
@@ -963,6 +971,7 @@ def fetch_assembly_atoms_df(
     atoms: set[str] | None = None,
     include_het: bool = False,
     prefer_label_seq: bool = True,
+    canonical_by_acc: dict[str, str | None] | None = None,
 ) -> dict:
     """
     Download assembly mmCIF, parse to atom DataFrame, and build metadata.
@@ -999,15 +1008,27 @@ def fetch_assembly_atoms_df(
         df = df.loc[df["model"] == model_idx].copy()
         df = df.reset_index(drop=True)
 
-        segments = fetch_sifts_segments(entry_id)
-        df = add_uniprot_from_sifts(df, segments)
-        df["item_id"] = assembly_key  # Adding assembly_key as an ID to DataFrame
-        df["abs_pos_label"] = df["resnum_uniprot"]
-
-        # Build metadata: chain -> UniProt using the entry-level chain map,
-        # but restricted to chains that actually appear in df["chain"].
+        # Restrict the chain -> UniProt map to chains that actually appear in df["chain"].
         df_chains = set(df["chain"].unique())
         chain_map = {ch: chain_map[ch] for ch in df_chains if ch in chain_map}
+
+        # Assign UniProt residue positions by aligning each chain's observed sequence to its canonical
+        # UniProt sequence. This replaces SIFTS label arithmetic (add_uniprot_from_sifts), which
+        # mis-numbers biological assemblies: gemmi re-assigns label_seq on the assembly, so the SIFTS
+        # offsets (described against the deposited entry) land residues in the wrong place.
+        # canonical_by_acc is normally pre-fetched once by the caller (the same proteins recur across
+        # thousands of assemblies); fall back to a per-assembly fetch only when called standalone.
+        needed = sorted({a for a in chain_map.values() if a})
+        if canonical_by_acc is None:
+            canonical_by_acc = fetch_uniprot_sequences(needed)
+        elif any(a not in canonical_by_acc for a in needed):
+            canonical_by_acc = {
+                **fetch_uniprot_sequences([a for a in needed if a not in canonical_by_acc]),
+                **canonical_by_acc,
+            }
+        df = add_uniprot_by_alignment(df, chain_map, canonical_by_acc)
+        df["item_id"] = assembly_key  # Adding assembly_key as an ID to DataFrame
+        df["abs_pos_label"] = df["resnum_uniprot"]
 
         # Ensuring that participant_protein and affected_protein_ac are present in chain_map
         if not participant_protein in chain_map.values():
@@ -1042,6 +1063,7 @@ def fetch_assemblies_atoms_parallel(
     show_progress: bool = True,
     parquet_dir: str | None = None,
     safetensors_dir: str | None = None,
+    canonical_by_acc: dict[str, str | None] | None = None,
 ):
     """
     Parallel wrapper that now splits the assembly flow:
@@ -1063,6 +1085,7 @@ def fetch_assemblies_atoms_parallel(
                 atoms=atoms,
                 include_het=include_het,
                 prefer_label_seq=prefer_label_seq,
+                canonical_by_acc=canonical_by_acc,
             )
 
             # Do nothing further if the download did not succeed

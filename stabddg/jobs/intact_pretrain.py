@@ -26,9 +26,14 @@ def prepare_intact_splits(
     random_state: int = 42,
     splits_subdir: str = "data_splits",
     intact_sample_size: Optional[int] = None,
+    write: bool = True,
 ) -> tuple[str, str, str]:
     """
     Creates df_train, df_valid, df_test and saves them into a dedicated sub-folder under model_save_dir.
+
+    The split is deterministic in ``random_state``, so every rank computes identical paths/contents.
+    Pass ``write=False`` on non-main ranks to avoid concurrent writes to the same files (the same
+    paths are still returned); the caller is responsible for a barrier before reading them back.
 
     Returns
     -------
@@ -62,17 +67,10 @@ def prepare_intact_splits(
         validate="m:m",
     )
 
-    # Expressing 'resulting_sequence' as sequence codes (replicate notebook)
-    # Note: the notebook used a regex pattern that removes all characters; we
-    # reproduce it literally to preserve identical behavior.
-    df["affected_protein_ac_seq_mut"] = df["affected_protein_ac_seq_mut"].str.replace(r".", "", regex=True)
-
-    # Calculating lengths
-    df["participant_protein_len"] = df["participant_protein_seq"].str.len()
-    df["affected_protein_ac_len"] = df["affected_protein_ac_seq"].str.len()
-    df["affected_protein_ac_mut_len"] = df["affected_protein_ac_seq_mut"].str.len()
-
-    # Explicitly creating a max_len column
+    # max_len drives the length filter in IntactDataset. The previously-computed
+    # affected_protein_ac_seq_mut / *_len helper columns were unused downstream and were derived
+    # via a buggy `.str.replace(r".", "")` (an unanchored regex that blanked the whole column), so
+    # they have been removed.
     df["max_len"] = df["biological_assembly_length"]
 
     # Convert range indices back to 1-based
@@ -80,12 +78,17 @@ def prepare_intact_splits(
     df["feature_ranges_end"] += 1
 
     # feature_type_category for stratification
+    feature_type_neu = IntactDataset.feature_type_neutral
     feature_type_pos = IntactDataset.feature_type_pos
     feature_type_neg = IntactDataset.feature_type_neg
 
-    df["feature_type_category"] = "neutral"
+    df["feature_type_category"] = "unknown"
+    df.loc[df["feature_type"].isin(feature_type_neu), "feature_type_category"] = "neutral"
     df.loc[df["feature_type"].isin(feature_type_pos), "feature_type_category"] = "positive"
     df.loc[df["feature_type"].isin(feature_type_neg), "feature_type_category"] = "negative"
+
+    # Removing complexes where the mutation impact is unknown
+    df = df.loc[df["feature_type_category"] != "unknown"].reset_index(drop=True)
 
     # Removing complexes formed by the same proteins
     df = df.loc[df["participant_protein"] != df["affected_protein_ac"]].reset_index(drop=True)
@@ -137,16 +140,17 @@ def prepare_intact_splits(
     valid_path = os.path.join(out_dir, "df_intact_mutations_filtered_valid.parquet")
     test_path = os.path.join(out_dir, "df_intact_mutations_filtered_test.parquet")
 
-    df_train.to_parquet(train_path)
+    if write:
+        df_train.to_parquet(train_path)
 
     if df_valid is None:
         valid_path = None
-    else:
+    elif write:
         df_valid.to_parquet(valid_path)
 
     if df_test is None:
         test_path = None
-    else:
+    elif write:
         df_test.to_parquet(test_path)
 
     return train_path, valid_path, test_path
@@ -199,7 +203,9 @@ def intact_pretrain(
     device = get_device(local_rank=local_rank)
     logger.info(f"Using device: {device}")
 
-    # Prepare IntAct train/valid/test splits and save into a dedicated subfolder under model_save_dir
+    # Prepare IntAct train/valid/test splits and save into a dedicated subfolder under model_save_dir.
+    # Only the main process writes the (deterministic) split files; other ranks compute the same paths
+    # in-memory and wait on a barrier so they never read a half-written parquet.
     train_p, valid_p, test_p = prepare_intact_splits(
         data_dir=data_dir,
         model_save_dir=model_save_dir,
@@ -207,7 +213,10 @@ def intact_pretrain(
         test_size=test_size,
         random_state=random_state,
         intact_sample_size=intact_sample_size,
+        write=_is_main_process(),
     )
+    if _is_dist_initialized():
+        torch.distributed.barrier()
     logger.info(f"Saved splits to:\n  train: {train_p}\n  valid: {valid_p}\n  test:  {test_p}")
 
     # Preparing Datasets

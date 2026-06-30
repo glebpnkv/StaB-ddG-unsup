@@ -26,6 +26,7 @@ from stabddg.intact.data import (
     normalize_entry,
 )
 from stabddg.intact.dataset import IntactDataset
+from stabddg.intact.uniprot import fetch_uniprot_sequences
 from stabddg.utils.gcp import download_dir_from_gcp, upload_dir_to_gcp
 
 logging.basicConfig(level=logging.INFO)
@@ -128,11 +129,21 @@ def fetch_and_summarize_assemblies_atoms(
         .values()
     )
 
+    # Pre-fetch canonical UniProt sequences ONCE for all proteins (they recur across thousands of
+    # assemblies). These are the alignment references used to number assembly residues; fetching them
+    # per-assembly would re-download the same sequences thousands of times and hammer the UniProt API.
+    all_accs = sorted(
+        set(df_assemblies["participant_protein"]) | set(df_assemblies["affected_protein_ac"])
+    )
+    logger.info("Pre-fetching canonical UniProt sequences for %d proteins…", len(all_accs))
+    canonical_by_acc = fetch_uniprot_sequences(all_accs)
+
     step_outcome = fetch_assemblies_atoms_parallel(
         assemblies=assemblies,
         parquet_dir=parquet_dir,
         safetensors_dir=safetensors_dir,
         max_workers=max_workers,
+        canonical_by_acc=canonical_by_acc,
     )
 
     # Filter to successful assemblies

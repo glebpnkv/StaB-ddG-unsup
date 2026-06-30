@@ -21,7 +21,9 @@ class ContrastiveLoss(_Loss):
     def __init__(
         self,
         tau: float = 1.0,
-        similarity: str = "cosine",  # "distance" or "cosine" (also accepts "dot")
+        similarity: str = "distance",  # "distance" or "cosine" (also accepts "dot");
+        # NB: cosine is degenerate on scalar (B,1) embeddings (it collapses to sign(a)*sign(b) ∈ {-1,+1}),
+        # so "distance" (negative squared distance) is the meaningful default for 1-D ddG predictions.
         lambda_supcon: float = 1.0,
         lambda_sign: float = 10.0,
         sign_margin: float = 0.2,       # margin in *neutral-normalised* units
@@ -89,11 +91,6 @@ class ContrastiveLoss(_Loss):
 
         raise ValueError(f"Unknown similarity='{self.similarity}'. Use 'distance', 'cosine', or 'dot'.")
 
-    def _masked_logsumexp(self, x: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
-        # x: (B,N), mask: (B,N) bool
-        x_masked = x.masked_fill(~mask, float("-inf"))
-        return torch.logsumexp(x_masked, dim=dim)
-
     def _reduce(self, x: torch.Tensor) -> torch.Tensor:
         if self.reduction == "mean":
             return x.mean()
@@ -114,13 +111,59 @@ class ContrastiveLoss(_Loss):
         return s
 
     def return_losses_and_metrics(self, z, z_sign, z_pos, z_neg, z_neu):
+        """
+        Computes the standard supervised contrastive loss with optional regularization terms.
+
+        The loss consists of three components:
+
+        **1. SupCon Loss (InfoNCE-style):**
+
+        For each anchor i with label y_i, let P(i) = {j : y_j = y_i} be positive samples
+        and N be all samples in the contrast pool (both positive and negative):
+
+        .. math::
+            \\mathcal{L}_{\\text{SupCon}}^{(i)} = -\\frac{1}{|P(i)|} \\sum_{p \\in P(i)} \\log \\frac{\\exp(s(z_i, z_p) / \\tau)}{\\sum_{j \\in N} \\exp(s(z_i, z_j) / \\tau)}
+
+        where s(·,·) is the similarity function (cosine, dot product, or negative squared distance).
+
+        **2. Sign-Direction Loss:**
+
+        Encourages predictions to have the correct sign with a margin:
+
+        .. math::
+            \\mathcal{L}_{\\text{sign}} = \\mathbb{E}_{y, z} [\\text{softplus}(m - y \\cdot z)]
+
+        where m is the margin (sign_margin) and y ∈ {-1, +1}.
+
+        **3. Neutral Regularization (optional):**
+
+        Keeps neutral samples near zero in normalized space:
+
+        .. math::
+            \\mathcal{L}_{\\text{neutral}} = \\mathbb{E}_{z_{\\text{neu}}} [\\hat{z}_{\\text{neu}}^2]
+
+        **Total Loss:**
+
+        .. math::
+            \\mathcal{L} = \\lambda_{\\text{SupCon}} \\mathcal{L}_{\\text{SupCon}} + \\lambda_{\\text{sign}} \\mathcal{L}_{\\text{sign}} + \\lambda_{\\text{neutral}} \\mathcal{L}_{\\text{neutral}}
+
+        Args:
+            z: Anchor predictions, shape (B, 1)
+            z_sign: Anchor labels in {-1, 0, +1}, shape (B, 1). Zero indicates unlabeled.
+            z_pos: Positive sample predictions, shape (B_pos, 1)
+            z_neg: Negative sample predictions, shape (B_neg, 1)
+            z_neu: Neutral sample predictions for normalization, shape (B_neu, 1)
+
+        Returns:
+            loss: Scalar total loss
+            metrics: Dict with detailed loss components and statistics
+        """
         dtype = z.dtype
         device = z.device
 
         # Flatten to (B, 1) shape consistently
         z = z.view(-1, 1)
         z_sign = z_sign.view(-1, 1)
-
         z_pos = z_pos.view(-1, 1)
         z_neg = z_neg.view(-1, 1)
         z_neu = z_neu.view(-1, 1)
@@ -146,10 +189,6 @@ class ContrastiveLoss(_Loss):
         # SupCon only defined for anchors with sign in {-1,+1}
         anchor_is_labeled = (z_sign.abs() == 1).view(-1)  # (B,)
 
-        # Similarity logits (B,N) with temperature
-        logits_raw = self._sim_matrix(z_hat, pool)  # (B,N)
-        logits = logits_raw / self.tau
-
         # Masks
         # same sign: y_i * y_j > 0 ; opposite: < 0
         w = (z_sign.to(dtype) * pool_sign.t())  # (B,N)
@@ -160,18 +199,23 @@ class ContrastiveLoss(_Loss):
         neg_count = neg_mask.sum(dim=1)  # (B,)
         valid = anchor_is_labeled & (pos_count > 0) & (neg_count > 0) & (pool.shape[0] > 0)
 
+        # Calculating similarities
+        logits_raw = self._sim_matrix(z_hat, pool)  # (B, N)
+        logits = logits_raw / self.tau              # (B, N)
+
         # ---- SupCon loss:  -mean_pos_logits + logsumexp(all_logits)
         # mean over positives per anchor
         pos_sum = (logits * pos_mask.to(dtype)).sum(dim=1)  # (B,)
         neg_sum = (logits * neg_mask.to(dtype)).sum(dim=1)  # (B,)
+        # Safe divisors
         pos_count_safe = pos_count.clamp_min(1).to(dtype)
         neg_count_safe = neg_count.clamp_min(1).to(dtype)
-        mean_pos = pos_sum / pos_count_safe  # (B,)
-        mean_neg = neg_sum / neg_count_safe
+        pos_mean = pos_sum / pos_count_safe  # (B,)
+        neg_mean = neg_sum / neg_count_safe
 
         lse_all = torch.logsumexp(logits, dim=1)  # (B,)
 
-        supcon_vec = (-mean_pos + lse_all) * valid.to(dtype)
+        supcon_vec = (-pos_mean + lse_all) * valid.to(dtype)
 
         if valid.any():
             supcon_loss = self._reduce(supcon_vec[valid])
@@ -206,46 +250,20 @@ class ContrastiveLoss(_Loss):
             B = z_hat.shape[0]
             N = pool.shape[0]
 
-            # Cosine matrix (B,N)
+            # Cosine matrix (B,N) — reported regardless of the training similarity
             a = z_hat.view(B, 1)
             b = pool.view(1, N) if N > 0 else pool.view(1, 0)
-            # Handles zero‑sized pool by creating zero tensors
             if N > 0:
                 cos_mat = (a * b) / (a.abs() * b.abs()).clamp_min(self.eps)
-                dist_mat = (a - b).abs()
-                sqdist_mat = (a - b) ** 2
             else:
                 cos_mat = z_hat.new_zeros((B, 0))
-                dist_mat = z_hat.new_zeros((B, 0))
-                sqdist_mat = z_hat.new_zeros((B, 0))
 
             # Per-anchor means
             cos_pos = self._per_anchor_masked_mean(cos_mat, pos_mask) if N > 0 else z_hat.new_zeros((B,))
             cos_neg = self._per_anchor_masked_mean(cos_mat, neg_mask) if N > 0 else z_hat.new_zeros((B,))
-            dist_pos = self._per_anchor_masked_mean(dist_mat, pos_mask) if N > 0 else z_hat.new_zeros((B,))
-            dist_neg = self._per_anchor_masked_mean(dist_mat, neg_mask) if N > 0 else z_hat.new_zeros((B,))
-            sqdist_pos = self._per_anchor_masked_mean(sqdist_mat, pos_mask) if N > 0 else z_hat.new_zeros((B,))
-            sqdist_neg = self._per_anchor_masked_mean(sqdist_mat, neg_mask) if N > 0 else z_hat.new_zeros((B,))
-
-            # SupCon breakdown pieces
-            pos_term_vec = (-mean_pos) * valid.to(dtype)       # (B,)
-            neg_term_vec = (-mean_neg) * valid.to(dtype)
-            den_term_vec = (lse_all) * valid.to(dtype)         # (B,)
-
-            # Denominator contribution fractions (how much of exp-sum comes from pos vs neg)
-            if valid.any() and N > 0:
-                lse_pos = self._masked_logsumexp(logits, pos_mask, dim=1)
-                lse_neg = self._masked_logsumexp(logits, neg_mask, dim=1)
-                # fractions in [0,1]
-                pos_frac = torch.exp(lse_pos - lse_all).masked_fill(~valid, 0.0)
-                neg_frac = torch.exp(lse_neg - lse_all).masked_fill(~valid, 0.0)
-            else:
-                pos_frac = z_hat.new_zeros((B,))
-                neg_frac = z_hat.new_zeros((B,))
 
             # Sign stats
             sign_violation_rate = 0.0
-            # Computes sign violation rate over labeled data
             if labeled_all.any():
                 yz = (y_all * z_all).view(-1)
                 sign_violation_rate = (yz < 0).to(torch.float32).mean().item()
@@ -258,158 +276,12 @@ class ContrastiveLoss(_Loss):
                 "loss_supcon": float(supcon_loss.detach().item()) if supcon_loss.numel() == 1 else float("nan"),
                 "loss_sign": float(sign_loss.detach().item()),
                 "loss_neutral_reg": float(neutral_reg.detach().item()),
-                "supcon_pos_term": mean_over_valid(pos_term_vec),
-                "supcon_den_term": mean_over_valid(den_term_vec),
-                "supcon_neg": mean_over_valid(neg_term_vec),
-                "supcon_denom_pos_frac": mean_over_valid(pos_frac),
-                "supcon_denom_neg_frac": mean_over_valid(neg_frac),
                 "cos_pos_mean": mean_over_valid(cos_pos),
                 "cos_neg_mean": mean_over_valid(cos_neg),
-                "dist_pos_mean": mean_over_valid(dist_pos),
-                "dist_neg_mean": mean_over_valid(dist_neg),
-                "sqdist_pos_mean": mean_over_valid(sqdist_pos),
-                "sqdist_neg_mean": mean_over_valid(sqdist_neg),
                 "neutral_mu0": float(mu0.detach().item()),
                 "neutral_sigma0": float(sigma0.detach().item()),
                 "sign_violation_rate": float(sign_violation_rate),
                 "num_valid_anchors": int(valid.sum().item()),
-            }
-
-        return loss, metrics
-
-
-class ContrastiveLossOld(ContrastiveLoss):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.tau_pos = 1.0
-        self.tau_neg = 1.0
-
-    def return_losses_and_metrics(self, z, z_sign, z_pos, z_neg, z_neu):
-        dtype = z.dtype
-        device = z.device
-
-        # Flatten to (B, 1) shape consistently
-        z = z.view(-1, 1)
-        z_sign = z_sign.view(-1, 1)
-
-        z_pos = z_pos.view(-1, 1)
-        z_neg = z_neg.view(-1, 1)
-        z_neu = z_neu.view(-1, 1)
-
-        # Build contrast pool: (+) then (-)
-        pool = torch.cat([z_pos, z_neg], dim=0)  # (N,1)
-        pool_sign = torch.cat(
-            [
-                torch.ones_like(z_pos, dtype=dtype, device=device),
-                - torch.ones_like(z_neg, dtype=dtype, device=device),
-            ],
-            dim=0,
-        )  # (N,1)
-
-        # SupCon only defined for anchors with sign in {-1,+1}
-        anchor_is_labeled = (z_sign.abs() == 1).view(-1)  # (B,)
-
-        # Masks
-        # same sign: y_i * y_j > 0 ; opposite: < 0
-        w = (z_sign.to(dtype) * pool_sign.t())  # (B,N)
-        same_mask = (w > 0) & anchor_is_labeled[:, None]
-        opp_mask = (w < 0) & anchor_is_labeled[:, None]
-
-        same_count = same_mask.sum(dim=1)  # (B,)
-        opp_count = opp_mask.sum(dim=1)  # (B,)
-        valid = anchor_is_labeled & (same_count > 0) & (opp_count > 0) & (pool.shape[0] > 0)
-
-        # Calculating cosine similarities
-        s = (z @ pool.T)         # (B, N)
-        s_pos = s / self.tau_pos     # (B, N)
-        s_neg = s / self.tau_neg     # (B, N)
-
-        # Neutral denominators (mirrored space for the opp term)
-        s_neu = (z @ z_neu.T)  # (B, B_neu)
-        lse_neu_pos = torch.logsumexp(s_neu / self.tau_pos, dim=1, keepdim=True)  # [B, 1]
-        lse_neu_neg = torch.logsumexp(-s_neu / self.tau_neg, dim=1, keepdim=True)  # [B, 1]
-
-        # Counts per anchor
-        pos_count = same_mask.sum(dim=1, keepdim=True)  # [B, 1]
-        neg_count = opp_mask.sum(dim=1, keepdim=True)  # [B, 1]
-
-        # Sums over selected pairs
-        same_mask_f = same_mask.to(s.dtype)
-        opp_mask_f = opp_mask.to(s.dtype)
-        pos_sum = (s_pos * same_mask_f).sum(dim=1, keepdim=True)  # [B, 1]
-        neg_sum = (s_neg * opp_mask_f).sum(dim=1, keepdim=True)  # [B, 1]
-
-        # Safe divisors
-        pos_count_safe = torch.clamp(pos_count, min=1)
-        neg_count_safe = torch.clamp(neg_count, min=1)
-
-        # Averaging: subtract count * LSE, then divide by count
-        # Note that the ddG value for +ve pairs should be negative
-        loss_pos_vec = -(pos_sum - pos_count * lse_neu_pos) / pos_count_safe
-        loss_neg_vec = -(-neg_sum - neg_count * lse_neu_neg) / neg_count_safe
-
-        # Zero-out anchors with no samples of that type
-        loss_pos_vec = loss_pos_vec * (pos_count > 0).to(s.dtype)
-        loss_neg_vec = loss_neg_vec * (neg_count > 0).to(s.dtype)
-
-        # ---- Sign-direction loss on all weakly-labeled points: anchors + sampled pos/neg
-        # Uses normalised z_hat, so margin is in neutral-normalised units.
-        y_all = torch.cat(
-            [z_sign, torch.ones_like(z_pos), -torch.ones_like(z_neg)], dim=0
-        ).view(-1, 1)
-        z_all = torch.cat([z, z_pos, z_neg], dim=0).view(-1, 1)
-
-        labeled_all = (y_all.abs() == 1).view(-1)
-
-        sign_loss = z.new_zeros(())
-        # Computes sign loss when labels exist and regularisation is enabled
-        if self.lambda_sign != 0.0 and labeled_all.any():
-            yz = (y_all * z_all).view(-1)
-            sign_loss = F.softplus(self.sign_margin - yz).mean()
-
-        loss_vec = loss_pos_vec + loss_neg_vec
-        loss = self._reduce(loss_vec) + self.lambda_sign * sign_loss
-
-        with torch.no_grad():
-            loss_pos = loss_pos_vec.mean()
-            loss_neg = loss_neg_vec.mean()
-
-            B = z.shape[0]
-            N = pool.shape[0]
-
-            # Cosine matrix (B,N)
-            a = z.view(B, 1)
-            b = pool.view(1, N) if N > 0 else pool.view(1, 0)
-            # Handles zero‑sized pool by creating zero tensors
-            if N > 0:
-                cos_mat = (a * b) / (a.abs() * b.abs()).clamp_min(self.eps)
-                dist_mat = (a - b).abs()
-                # sqdist_mat = (a - b) ** 2
-            else:
-                cos_mat = z.new_zeros((B, 0))
-
-            # Per-anchor means
-            cos_pos = self._per_anchor_masked_mean(cos_mat, same_mask) if N > 0 else z.new_zeros((B,))
-            cos_neg = self._per_anchor_masked_mean(cos_mat, opp_mask) if N > 0 else z.new_zeros((B,))
-
-            # Sign stats
-            sign_violation_rate = 0.0
-            # Computes sign violation rate over labeled data
-            if labeled_all.any():
-                yz = (y_all * z_all).view(-1)
-                sign_violation_rate = (yz < 0).to(torch.float32).mean().item()
-
-            def mean_over_valid(v):
-                return v[valid].mean().item() if valid.any() else 0.0
-
-            metrics = {
-                "loss_total": float(loss.detach().item()) if loss.numel() == 1 else float("nan"),
-                "loss_pos": float(loss_pos.detach().item()) if loss_pos.numel() == 1 else float("nan"),
-                "loss_neg": float(loss_neg.detach().item()) if loss_neg.numel() == 1 else float("nan"),
-                "loss_sign": float(sign_loss.detach().item()),
-                "cos_pos_mean": mean_over_valid(cos_pos),
-                "cos_neg_mean": mean_over_valid(cos_neg),
-                "sign_violation_rate": float(sign_violation_rate),
             }
 
         return loss, metrics

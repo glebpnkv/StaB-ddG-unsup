@@ -77,11 +77,19 @@ def train_step(
 
     i = 0
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False, disable=not _is_main_process())
-    
+
+    # Persistent iterator over the (infinite) contrastive stream: calling iter() on every batch
+    # would restart the DataLoader workers and always return the very first sampled pool.
+    contrast_iter = iter(dataloader_contrastive)
+
     # Iterating over batches
     for batch in pbar:
-        # Fetching a sample of contrastive datapoints
-        batch_contrast = next(iter(dataloader_contrastive))
+        # Fetching a fresh sample of contrastive datapoints
+        try:
+            batch_contrast = next(contrast_iter)
+        except StopIteration:
+            contrast_iter = iter(dataloader_contrastive)
+            batch_contrast = next(contrast_iter)
 
         with autocast(device_type="cuda", dtype=amp_dtype, enabled=torch.cuda.is_available()):
             # Use fused model method to reduce graph fragmentation and allocations
@@ -141,6 +149,7 @@ def train_step(
             {
                 "anchor_idx": batch["anchor_idx"].detach().cpu().numpy(),
                 "forecast": z_anchor.detach().cpu().numpy(),
+                "sign": batch["sign"].detach().cpu().numpy(),
             }
         )
         df_forecasts = pd.concat([df_forecasts, df_forecasts_cur], ignore_index=True)
@@ -179,9 +188,14 @@ def validation_step(
     i = 0
     with torch.no_grad(), autocast(device_type="cuda", dtype=amp_dtype, enabled=torch.cuda.is_available()):
         pbar = tqdm(dataloader, desc=f"{step_name} Epoch {epoch}", leave=False, disable=not _is_main_process())
+        contrast_iter = iter(dataloader_contrastive)
         for batch in pbar:
-            # Fetching a sample of contrastive datapoints
-            batch_contrast = next(iter(dataloader_contrastive))
+            # Fetching a fresh sample of contrastive datapoints
+            try:
+                batch_contrast = next(contrast_iter)
+            except StopIteration:
+                contrast_iter = iter(dataloader_contrastive)
+                batch_contrast = next(contrast_iter)
 
             with autocast(device_type="cuda", dtype=amp_dtype, enabled=torch.cuda.is_available()):
                 # Use fused model method to reduce graph fragmentation and allocations
@@ -289,6 +303,10 @@ def pretrain(
         os.makedirs(metrics_save_dir, exist_ok=True)
         os.makedirs(default_tensorboard_log_dir, exist_ok=True)
 
+    # Default to the module logger on every rank; the main process additionally attaches a file handler
+    # below. Without this, non-main ranks would hit an UnboundLocalError when passing logger_file on.
+    logger_file = logger
+
     # Creating a logging file logs.txt (main process only)
     if _is_main_process():
         log_path = os.path.join(save_dir, "logs.txt")
@@ -343,7 +361,7 @@ def pretrain(
         num_workers=num_dataloader_workers,
         collate_fn=passthrough_collate_fn,
         pin_memory=True,
-        persistent_workers=True
+        persistent_workers=(num_dataloader_workers > 0),
     )
 
     # Saving the initial model checkpoint
@@ -373,6 +391,10 @@ def pretrain(
         logger.info("TensorBoard writer DISABLED (rank!=0 or no log dir)")
 
     for epoch in tqdm(range(n_epochs), desc="Epoch"):
+        # Reshuffle distinctly each epoch under DistributedSampler (no-op otherwise)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         # Running training step
         train_metrics, df_forecasts_train = train_step(
             model=model,

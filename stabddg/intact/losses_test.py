@@ -8,7 +8,7 @@ from accelerate import Accelerator
 from torch.utils.data import Dataset, IterableDataset, get_worker_info, DataLoader
 from tqdm.auto import tqdm
 
-from stabddg.intact.losses import ContrastiveLoss, ContrastiveLossOld
+from stabddg.intact.losses import ContrastiveLoss
 
 
 class RegressionModel(torch.nn.Module):
@@ -38,8 +38,10 @@ class SynthDataset(Dataset):
         df = df_synth.copy()
 
         # Split by sign
-        self.df_pos = df.loc[df["sign"] == 1].copy()
-        self.df_neg = df.loc[df["sign"] == -1].copy()
+        # self.df_pos = df.loc[df["sign"] == 1].copy()
+        # self.df_neg = df.loc[df["sign"] == -1].copy()
+        self.df_pos = df.loc[df["sign"] == -1].copy()
+        self.df_neg = df.loc[df["sign"] == 1].copy()
         self.df_neutral = df.loc[df["sign"] == 0].copy()
         self.df = pd.concat([self.df_pos, self.df_neg, self.df_neutral])
 
@@ -102,14 +104,14 @@ class SynthDataset(Dataset):
     def _sample(self):
         # Sampling positive values
         sample_pos = self.df.loc[
-            self.df["sign"] == 1
+            self.df["sign"] == -1
         ].sample(
             self.k_pos,
             replace=True  # Safety
         ).index
 
         sample_neg = self.df.loc[
-            self.df["sign"] == -1
+            self.df["sign"] == 1
         ].sample(
             self.k_neg,
             replace=True  # Safety
@@ -228,6 +230,7 @@ def _train(
     lambda_supcon: float = 1.0,
     lambda_sign: float = 0.0,
     lambda_neutral: float = 0.0,
+    loss_fn: ContrastiveLoss = ContrastiveLoss
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     # Device
     accelerator = Accelerator()
@@ -256,11 +259,11 @@ def _train(
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = ContrastiveLoss(
-        lambda_supcon=lambda_supcon,
-        lambda_sign=lambda_sign,
-        lambda_neutral=lambda_neutral,
-    )
+    # loss_fn = ContrastiveLoss(
+    #     lambda_supcon=lambda_supcon,
+    #     lambda_sign=lambda_sign,
+    #     lambda_neutral=lambda_neutral,
+    # )
     # loss_fn = ContrastiveLossOld(
     #     lambda_supcon=lambda_supcon,
     #     lambda_sign=lambda_sign,
