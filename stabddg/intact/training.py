@@ -109,7 +109,47 @@ class _RunLogger:
         self._stack.close()
 
 
-def _forward_neutrals(model, loss_fn, neutral_batch, ref: torch.Tensor) -> torch.Tensor:
+def _slice_pool(batch: dict, start: int, end: int) -> dict:
+    """Slice a collated anchor/pool batch along dim 0 (the datapoint axis).
+
+    A batch is ``{"complex"/"binder1"/"binder2": {tensor_key: [B, ...]}, ...}`` (plus a scalar
+    ``max_length`` per branch, and ``anchor_idx``/``sign`` on the anchor batch). We slice every tensor
+    ``[start:end]`` and pass non-tensors (e.g. ``max_length``) through untouched.
+    """
+    out: dict = {}
+    for key, val in batch.items():
+        if isinstance(val, dict):
+            out[key] = {k: (v[start:end] if torch.is_tensor(v) else v) for k, v in val.items()}
+        elif torch.is_tensor(val):
+            out[key] = val[start:end]
+        else:
+            out[key] = val
+    return out
+
+
+def _microbatched_forward(model, batch: dict, micro_batch_size: int) -> torch.Tensor:
+    """``fused_forward_intact_datapoint`` over a collated batch, optionally in chunks.
+
+    When ``micro_batch_size > 0`` (and smaller than the batch), the batch is split into chunks of that
+    many datapoints, each forwarded separately, and the scalar outputs concatenated back to ``[B]``.
+    Concatenation is the whole "un-glue": the loss consumes these as a flat dim-0 stack, and grads
+    flow through ``torch.cat``. This caps *forward-time* peak activation memory — fully so for
+    no-grad pools (neutrals, validation), where each chunk's activations free immediately. For
+    grad-requiring pools the backward still needs every chunk's activations at once, so pair this with
+    gradient checkpointing to also cap the backward peak.
+    """
+    fwd = _unwrap_model(model).fused_forward_intact_datapoint
+    B = batch["complex"]["S"].shape[0]
+    if not micro_batch_size or micro_batch_size <= 0 or micro_batch_size >= B:
+        return fwd(batch)
+    outs = [
+        fwd(_slice_pool(batch, s, min(s + micro_batch_size, B)))
+        for s in range(0, B, micro_batch_size)
+    ]
+    return torch.cat(outs, dim=0)
+
+
+def _forward_neutrals(model, loss_fn, neutral_batch, ref: torch.Tensor, micro_batch_size: int = 0) -> torch.Tensor:
     """Forward the neutral contrast pool, but only with the autograd graph it actually needs.
 
     Neutrals feed two things in ``ContrastiveLoss``: the (always-detached) robust centre/scale
@@ -127,9 +167,9 @@ def _forward_neutrals(model, loss_fn, neutral_batch, ref: torch.Tensor) -> torch
     if not need_neu:
         return ref.new_zeros(0)
     if need_grad:
-        return _unwrap_model(model).fused_forward_intact_datapoint(neutral_batch)
+        return _microbatched_forward(model, neutral_batch, micro_batch_size)
     with torch.no_grad():
-        return _unwrap_model(model).fused_forward_intact_datapoint(neutral_batch)
+        return _microbatched_forward(model, neutral_batch, micro_batch_size)
 
 
 def _maybe_float(value):
@@ -168,6 +208,8 @@ def train_step(
     grad_accum_steps: int = 1,
     amp_dtype: torch.dtype = default_amp_dtype,
     tb_writer = None,
+    micro_batch_size: int = 0,
+    log_every_batches: int = 1,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     # Preparing the model and the optimiser for training
     _unwrap_model(model).train()
@@ -182,6 +224,7 @@ def train_step(
     all_train_metrics = None
 
     i = 0
+    n_batches = len(dataloader)
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False, disable=not _is_main_process())
 
     # Persistent iterator over the (infinite) contrastive stream: calling iter() on every batch
@@ -198,11 +241,11 @@ def train_step(
             batch_contrast = next(contrast_iter)
 
         with autocast(device_type="cuda", dtype=amp_dtype, enabled=torch.cuda.is_available()):
-            # Use fused model method to reduce graph fragmentation and allocations
-            z_anchor = _unwrap_model(model).fused_forward_intact_datapoint(batch)
-            z_pos = _unwrap_model(model).fused_forward_intact_datapoint(batch_contrast["positive"])
-            z_neg = _unwrap_model(model).fused_forward_intact_datapoint(batch_contrast["negative"])
-            z_neu = _forward_neutrals(model, loss_fn, batch_contrast["neutral"], z_anchor)
+            # Fused per-pool forward, optionally micro-batched to cap peak activation memory.
+            z_anchor = _microbatched_forward(model, batch, micro_batch_size)
+            z_pos = _microbatched_forward(model, batch_contrast["positive"], micro_batch_size)
+            z_neg = _microbatched_forward(model, batch_contrast["negative"], micro_batch_size)
+            z_neu = _forward_neutrals(model, loss_fn, batch_contrast["neutral"], z_anchor, micro_batch_size)
 
             z_sign = batch["sign"].to(z_anchor.device, non_blocking=True)
 
@@ -231,11 +274,15 @@ def train_step(
         if _is_main_process():
             pbar.set_description(f"Train Batch {i + 1}")
             pbar.set_postfix(metrics)
-            # pbar.update(1)
-            output_logger.info(
+            batch_line = (
                 f'{print_prefix}: Batch {i + 1} Train metrics: '
                 f'{ {k: "{0:0.4f}".format(v) for k, v in metrics.items() if v is not None} }'
             )
+            # Full per-batch record to logs.txt; throttled copy to stdout so CloudWatch (and
+            # metric_definitions) get per-batch metrics without one line per step drowning the log.
+            output_logger.info(batch_line)
+            if (i % max(log_every_batches, 1) == 0) or (i + 1 == n_batches):
+                logger.info(batch_line)
             if tb_writer is not None:
                 step = epoch * len(dataloader) + i + 1
                 for k, v in metrics.items():
@@ -285,6 +332,8 @@ def validation_step(
     output_logger = logger,
     amp_dtype: torch.dtype = default_amp_dtype,
     tb_writer = None,
+    micro_batch_size: int = 0,
+    log_every_batches: int = 1,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     _unwrap_model(model).eval()
     print_prefix = f"Epoch {epoch + 1}"
@@ -292,6 +341,7 @@ def validation_step(
     df_forecasts = pd.DataFrame()
     all_metrics = None
     i = 0
+    n_batches = len(dataloader)
     with torch.no_grad(), autocast(device_type="cuda", dtype=amp_dtype, enabled=torch.cuda.is_available()):
         pbar = tqdm(dataloader, desc=f"{step_name} Epoch {epoch}", leave=False, disable=not _is_main_process())
         contrast_iter = iter(dataloader_contrastive)
@@ -304,11 +354,11 @@ def validation_step(
                 batch_contrast = next(contrast_iter)
 
             with autocast(device_type="cuda", dtype=amp_dtype, enabled=torch.cuda.is_available()):
-                # Use fused model method to reduce graph fragmentation and allocations
-                z_anchor = _unwrap_model(model).fused_forward_intact_datapoint(batch)
-                z_pos = _unwrap_model(model).fused_forward_intact_datapoint(batch_contrast["positive"])
-                z_neg = _unwrap_model(model).fused_forward_intact_datapoint(batch_contrast["negative"])
-                z_neu = _forward_neutrals(model, loss_fn, batch_contrast["neutral"], z_anchor)
+                # Fused per-pool forward, optionally micro-batched to cap peak activation memory.
+                z_anchor = _microbatched_forward(model, batch, micro_batch_size)
+                z_pos = _microbatched_forward(model, batch_contrast["positive"], micro_batch_size)
+                z_neg = _microbatched_forward(model, batch_contrast["negative"], micro_batch_size)
+                z_neu = _forward_neutrals(model, loss_fn, batch_contrast["neutral"], z_anchor, micro_batch_size)
 
                 z_sign = batch["sign"].to(z_anchor.device, non_blocking=True)
 
@@ -324,11 +374,13 @@ def validation_step(
                 if isinstance(pbar, tqdm):
                     pbar.set_description(f"{step_name} Batch {i + 1}")
                     pbar.set_postfix(metrics)
-                    # pbar.update(1)
-                output_logger.info(
+                batch_line = (
                     f'{print_prefix}: Batch {i + 1} {step_name} metrics: '
                     f'{ {k: "{0:0.4f}".format(v) for k, v in metrics.items() if v is not None} }'
                 )
+                output_logger.info(batch_line)
+                if (i % max(log_every_batches, 1) == 0) or (i + 1 == n_batches):
+                    logger.info(batch_line)
                 if tb_writer is not None:
                     step = epoch * len(dataloader) + i + 1
                     split_prefix = step_name.lower()
@@ -374,14 +426,17 @@ def pretrain(
     dataset_test: IntactDataset,
     save_dir: str,
     batch_size: int = 4,
+    micro_batch_size: int = 0,
     num_dataloader_workers: int = 1,
     lr: float = 1e-4,
     lambda_supcon: float = 1.0,
     lambda_sign: float = 10.0,
     lambda_neutral: float = 0.0,
+    use_neutral_normalizer: bool = False,
     n_epochs: int = 10,
     model_val_freq: int = 2,
     model_save_freq: int = 1,
+    log_every_batches: int = 1,
     use_wandb: bool = False,
     grad_accum_steps: int = 1,
 ):
@@ -390,6 +445,7 @@ def pretrain(
         lambda_supcon=lambda_supcon,
         lambda_sign=lambda_sign,
         lambda_neutral=lambda_neutral,
+        use_neutral_normalizer=use_neutral_normalizer,
     )
 
     # DataFrame with training, validation and test metrics
@@ -529,6 +585,8 @@ def pretrain(
             grad_accum_steps=grad_accum_steps,
             output_logger=logger_file,
             tb_writer=tb_writer,
+            micro_batch_size=micro_batch_size,
+            log_every_batches=log_every_batches,
         )
 
         # Collecting metrics from the training step
@@ -577,6 +635,8 @@ def pretrain(
                 output_logger=logger_file,
                 step_name="Validation",
                 tb_writer=tb_writer,
+                micro_batch_size=micro_batch_size,
+                log_every_batches=log_every_batches,
             )
 
             if _is_main_process():
@@ -616,6 +676,8 @@ def pretrain(
         epoch=n_epochs,
         step_name="Test",
         output_logger=logger_file,
+        micro_batch_size=micro_batch_size,
+        log_every_batches=log_every_batches,
     )
 
     if _is_main_process():

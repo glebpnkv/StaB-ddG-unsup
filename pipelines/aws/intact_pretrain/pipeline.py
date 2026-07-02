@@ -50,16 +50,32 @@ def build_pipeline() -> Pipeline:
     run_name = ParameterString("RunName", default_value="intact-pretrain")
     epochs = ParameterInteger("Epochs", default_value=5)
     batch_size = ParameterInteger("BatchSize", default_value=2)
-    max_length = ParameterInteger("MaxLength", default_value=400)
+    # If >0, forward each contrast pool in chunks of this many datapoints (concatenating outputs) to
+    # cap peak activation memory — lets larger k_* fit a fixed GPU. 0 = whole pool at once.
+    micro_batch_size = ParameterInteger("MicroBatchSize", default_value=2)
+    # If 1, gradient-checkpoint the ProteinMPNN forward (recompute in backward) to also cap the
+    # backward-pass activation peak (~30% slower). Pairs with MicroBatchSize for large pools.
+    grad_checkpoint = ParameterInteger("GradCheckpoint", default_value=1)
+    # 768 keeps ~73% of SKEMPI eval mutations' length regime + recovers long IntAct positives.
+    # Overridable at start-time (e.g. 1024 for ~98% SKEMPI coverage, with micro_batch_size=1).
+    max_length = ParameterInteger("MaxLength", default_value=768)
     lr = ParameterFloat("LearningRate", default_value=1e-3)
     # Each step runs k_pos + k_neg + k_neutral separate ProteinMPNN forwards PER RANK, so these drive
-    # per-GPU memory. 4/4/8 fits an A10G (24 GB) at max_length=400; the GCP defaults (5/5/20) OOM it.
-    k_neutral = ParameterInteger("KNeutral", default_value=8)
-    k_pos = ParameterInteger("KPos", default_value=4)
-    k_neg = ParameterInteger("KNeg", default_value=4)
-    lambda_sign = ParameterFloat("LambdaSign", default_value=0.0)
+    # per-GPU memory. 5/5/20 (the original target) fits an A10G (24 GB) at max_length=768 ONLY with the
+    # memory levers above (micro_batch_size + grad_checkpoint); without them use 4/4/8 or drop them.
+    k_neutral = ParameterInteger("KNeutral", default_value=20)
+    k_pos = ParameterInteger("KPos", default_value=5)
+    k_neg = ParameterInteger("KNeg", default_value=5)
+    # >0 anchors the ΔΔG sign to the weak labels. With 0 the distance-based SupCon term is
+    # sign-invariant (z -> -z preserves all pairwise distances), so the direction is not identifiable
+    # from the loss and a falling loss does NOT certify a correct sign — hence a positive default.
+    lambda_sign = ParameterFloat("LambdaSign", default_value=1.0)
     lambda_neutral = ParameterFloat("LambdaNeutral", default_value=0.0)
+    # Centre/scale ΔΔG by the neutral pool's robust median/MAD before the contrastive + sign terms.
+    use_neutral_normalizer = ParameterInteger("UseNeutralNormalizer", default_value=1)
     model_val_freq = ParameterInteger("ModelValFreq", default_value=5)
+    # Per-batch metrics to stdout every N batches (1 = every batch); per-epoch summaries always log.
+    log_every_batches = ParameterInteger("LogEveryBatches", default_value=1)
     approval = ParameterString("ModelApprovalStatus", default_value="PendingManualApproval")
 
     # TensorBoard event files written by training are synced to S3 (the train loop already honours
@@ -103,12 +119,13 @@ def build_pipeline() -> Pipeline:
         hyperparameters={
             "run_name": run_name,
             "data_dir": "/opt/ml/input/data/intact",
-            "proteins_dir": "/opt/ml/input/data/intact/proteins/safetensors",
             "assemblies_dir": "/opt/ml/input/data/intact/assemblies/safetensors",
             "model_save_dir": "/opt/ml/model",
             "model_existing_checkpoint": "/app/model_ckpts/proteinmpnn.pt",
             "max_length": max_length,
             "batch_size": batch_size,
+            "micro_batch_size": micro_batch_size,
+            "grad_checkpoint": grad_checkpoint,
             "epochs": epochs,
             "lr": lr,
             "k_neutral": k_neutral,
@@ -116,7 +133,9 @@ def build_pipeline() -> Pipeline:
             "k_neg": k_neg,
             "lambda_sign": lambda_sign,
             "lambda_neutral": lambda_neutral,
+            "use_neutral_normalizer": use_neutral_normalizer,
             "model_val_freq": model_val_freq,
+            "log_every_batches": log_every_batches,
         },
         tags=config.DEFAULT_TAGS,
     )
@@ -149,8 +168,9 @@ def build_pipeline() -> Pipeline:
     return Pipeline(
         name=PIPELINE_NAME,
         parameters=[
-            bucket, prefix, data_uri, instance_type, run_name, epochs, batch_size, max_length, lr,
-            k_neutral, k_pos, k_neg, lambda_sign, lambda_neutral, model_val_freq, approval,
+            bucket, prefix, data_uri, instance_type, run_name, epochs, batch_size, micro_batch_size,
+            grad_checkpoint, max_length, lr, k_neutral, k_pos, k_neg, lambda_sign, lambda_neutral,
+            use_neutral_normalizer, model_val_freq, log_every_batches, approval,
         ],
         steps=[train_step, register_step],
         sagemaker_session=session,

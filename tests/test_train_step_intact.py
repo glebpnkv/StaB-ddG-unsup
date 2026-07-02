@@ -39,7 +39,6 @@ def _build_small_model(device: torch.device) -> StaBddG:
 
 def _build_dataset(max_length: int = 192) -> IntactDataset:
     data_dir = os.path.join("data", "intact")
-    proteins_dir = os.path.join(data_dir, "proteins", "safetensors")
     assemblies_dir = os.path.join(data_dir, "assemblies", "safetensors")
 
     parquet_candidates = [
@@ -52,7 +51,6 @@ def _build_dataset(max_length: int = 192) -> IntactDataset:
 
     ds = IntactDataset(
         df_intact_path=df_intact_path,
-        proteins_dir=proteins_dir,
         assemblies_dir=assemblies_dir,
         max_length=max_length,
         k_neutral=8,

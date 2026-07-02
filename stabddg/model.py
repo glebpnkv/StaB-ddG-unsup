@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from .mpnn_utils import featurize, ProteinMPNN
 
@@ -10,13 +11,17 @@ class StaBddG(nn.Module):
         pmpnn: ProteinMPNN,
         use_antithetic_variates=True,
         noise_level=0.1,
-        device="cuda"
+        device="cuda",
+        use_grad_checkpoint=False,
     ):
         super(StaBddG, self).__init__()
         self.pmpnn: ProteinMPNN = pmpnn
         self.use_antithetic_variates = use_antithetic_variates
         self.noise_level = noise_level
         self.device = device
+        # Recompute the ProteinMPNN forward during backward instead of storing its activations —
+        # trades ~30% compute for a large activation-memory cut, letting bigger contrast pools fit.
+        self.use_grad_checkpoint = use_grad_checkpoint
 
     def get_wt_seq(self, domain):
         """Returns the wild type sequence of a protein."""
@@ -172,16 +177,27 @@ class StaBddG(nn.Module):
                 order, noise = None, None
 
             def _mpnn(seqs):
-                log_probs = self.pmpnn(
-                    X=X,
-                    S=seqs,
-                    mask=mask,
-                    chain_M=chain_M,
-                    residue_idx=residue_idx,
-                    chain_encoding_all=chain_encoding_all,
-                    fix_order=order,
-                    fix_backbone_noise=noise,
-                )  # [B, L, 21]
+                if self.use_grad_checkpoint and torch.is_grad_enabled():
+                    # Positional args match ProteinMPNN.forward(X, S, mask, chain_M, residue_idx,
+                    # chain_encoding_all, fix_order, fix_backbone_noise). use_reentrant=False is
+                    # required (no input tensor needs grad — only the params do) and preserves the
+                    # RNG state, so a stochastic decode order recomputes identically in backward.
+                    log_probs = checkpoint(
+                        self.pmpnn,
+                        X, seqs, mask, chain_M, residue_idx, chain_encoding_all, order, noise,
+                        use_reentrant=False,
+                    )  # [B, L, 21]
+                else:
+                    log_probs = self.pmpnn(
+                        X=X,
+                        S=seqs,
+                        mask=mask,
+                        chain_M=chain_M,
+                        residue_idx=residue_idx,
+                        chain_encoding_all=chain_encoding_all,
+                        fix_order=order,
+                        fix_backbone_noise=noise,
+                    )  # [B, L, 21]
                 seq_oh = torch.nn.functional.one_hot(seqs, 21).to(log_probs.dtype)  # [B, L, 21]
                 return torch.sum(seq_oh * log_probs, dim=(1, 2))  # [B]
 

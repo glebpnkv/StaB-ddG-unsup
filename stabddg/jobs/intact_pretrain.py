@@ -160,7 +160,6 @@ def prepare_intact_splits(
 def intact_pretrain(
     run_name: str,
     data_dir: str,
-    proteins_dir: str,
     assemblies_dir: str,
     model_save_dir,
     max_length: int = 256,
@@ -168,22 +167,99 @@ def intact_pretrain(
     k_pos: int = 16,
     k_neg: int = 16,
     batch_size: int = 4,
+    micro_batch_size: int = 0,
     epochs: int = 5,
     lr: float = 1e-3,
     noise_level: float = 0.1,
     lambda_supcon: float = 1.0,
     lambda_sign: float = 10.0,
     lambda_neutral: float = 0.0,
+    use_neutral_normalizer: bool = False,
     valid_size: float = 0.1,
     test_size: float = 0.1,
     random_state: int = 42,
     num_dataloader_workers: int = 1,
     model_val_freq: int = 5,
+    log_every_batches: int = 1,
     use_antithetic_variates: bool = True,
+    use_grad_checkpoint: bool = False,
     model_existing_checkpoint: Optional[str] = None,
     use_wandb: bool = False,
     intact_sample_size: Optional[int] = None,
 ):
+    """Contrastive weakly-supervised pretraining of a ProteinMPNN-based binding-ΔΔG predictor on IntAct.
+
+    Launches (optionally multi-GPU via torchrun/DDP) supervised-contrastive pretraining where each
+    anchor is an IntAct mutation with a weak sign label (+1 interaction-increasing, −1
+    decreasing/disrupting, 0 neutral) and the model scores it as a binding ΔΔG. See
+    ``stabddg/intact/training.py`` for the loop and ``ContrastiveLoss`` for the objective.
+
+    Parameters
+    ----------
+    run_name : str
+        Human-readable name for the run (used in logs / experiment tracking).
+    data_dir : str
+        Root of the training-ready IntAct bundle. Must contain
+        ``df_intact_mutations_filtered.parquet`` and ``df_assemblies_filtered.parquet``.
+    assemblies_dir : str
+        Directory of per-assembly structure safetensors (``<biological_assembly>.safetensors``) —
+        the only structures training loads. (There is intentionally no ``proteins_dir``: the AlphaFold
+        monomers are extraction-only, consumed by the offline WT oracle, not by training.)
+    model_save_dir : str
+        Output directory for checkpoints, split parquet files, ``metrics.csv``/``forecasts.csv``,
+        ``logs.txt`` and TensorBoard events.
+    max_length : int
+        Drop assemblies longer than this and truncate/pad to it. Caps per-datapoint memory.
+    k_neutral, k_pos, k_neg : int
+        Contrast-pool sizes sampled per step: neutrals (label 0), positives (+1), negatives (−1).
+        Each pool item is a full ProteinMPNN forward *per rank*, so these dominate per-GPU memory.
+        Neutrals are forwarded without grad (or skipped) unless ``lambda_neutral > 0``.
+    batch_size : int
+        Number of anchors per optimizer step (per rank).
+    micro_batch_size : int
+        If > 0, split each pool (anchor/pos/neg/neutral) into chunks of this many datapoints, forward
+        each chunk separately, and concatenate the scalar outputs. 0 disables chunking (whole pool at
+        once). Reduces peak activation memory for the no-grad neutral pool and validation; for the
+        grad-requiring pools it lowers the forward-time peak but not the backward peak (pair with
+        gradient checkpointing for that). Lets larger ``k_*`` fit a fixed GPU.
+    epochs : int
+        Number of training epochs.
+    lr : float
+        Adam learning rate.
+    noise_level : float
+        Backbone-noise magnitude (Å) for the StaB-ddG antithetic variates.
+    lambda_supcon, lambda_sign, lambda_neutral : float
+        Loss weights: supervised-contrastive term, sign-direction margin term, and neutral
+        regularisation. ``lambda_neutral > 0`` makes neutrals require gradients.
+    use_neutral_normalizer : bool
+        Centre/scale all ΔΔG values by the neutral pool's robust median/MAD before the contrastive +
+        sign terms. Removes an arbitrary global offset and sets a common scale (it does NOT equalize
+        per-complex/length variance). At ``max_length=640`` neutrals are length-representative, so the
+        estimate is well-calibrated; forces the neutral pool to be forwarded (see ``_forward_neutrals``).
+    valid_size, test_size : float
+        Fractions of the data held out for validation and test (stratified by feature-type category).
+    random_state : int
+        Seed for the deterministic train/valid/test split (every rank computes identical paths).
+    num_dataloader_workers : int
+        DataLoader worker processes per rank.
+    model_val_freq : int
+        Run validation every this many epochs.
+    log_every_batches : int
+        Emit a per-batch metrics line to stdout (→ CloudWatch) every this many batches (1 = every
+        batch). Per-epoch summaries are always logged. Raise it on full data to reduce log volume.
+    use_antithetic_variates : bool
+        Use antithetic decoding-order / backbone-noise variates in StaB-ddG (variance reduction).
+    use_grad_checkpoint : bool
+        Recompute the ProteinMPNN forward during backward instead of storing its activations (~30%
+        slower, large memory cut). Complements ``micro_batch_size`` by also capping the *backward*
+        peak, so larger ``k_*`` pools fit a fixed GPU.
+    model_existing_checkpoint : str or None
+        Path to a ProteinMPNN/StaB-ddG checkpoint to warm-start from; None trains from scratch.
+    use_wandb : bool
+        Also log to Weights & Biases (in addition to TensorBoard / SageMaker Experiments / MLflow).
+    intact_sample_size : int or None
+        If set, subsample this many rows per feature-type category before splitting (debugging only).
+    """
     # Resolve local_rank from env when launched via torchrun
     local_rank = None
     env_local_rank = os.environ.get("LOCAL_RANK")
@@ -234,7 +310,6 @@ def intact_pretrain(
     # Preparing Datasets
     ds_train = IntactDataset(
         df_intact_path=train_p,
-        proteins_dir=proteins_dir,
         assemblies_dir=assemblies_dir,
         max_length=max_length,
         k_neutral=k_neutral,
@@ -244,7 +319,6 @@ def intact_pretrain(
 
     ds_valid = IntactDataset(
         df_intact_path=valid_p,
-        proteins_dir=proteins_dir,
         assemblies_dir=assemblies_dir,
         max_length=max_length,
         k_neutral=k_neutral,
@@ -254,7 +328,6 @@ def intact_pretrain(
 
     ds_test = IntactDataset(
         df_intact_path=test_p,
-        proteins_dir=proteins_dir,
         assemblies_dir=assemblies_dir,
         max_length=max_length,
         k_neutral=k_neutral,
@@ -289,6 +362,7 @@ def intact_pretrain(
         use_antithetic_variates=use_antithetic_variates,
         noise_level=noise_level,
         device=device,
+        use_grad_checkpoint=use_grad_checkpoint,
     )
 
     _ = model.to(device)
@@ -321,12 +395,15 @@ def intact_pretrain(
         dataset_test=ds_test,
         save_dir=model_save_dir,
         batch_size=batch_size,
+        micro_batch_size=micro_batch_size,
         num_dataloader_workers=num_dataloader_workers,
         lambda_supcon=lambda_supcon,
         lambda_sign=lambda_sign,
         lambda_neutral=lambda_neutral,
+        use_neutral_normalizer=use_neutral_normalizer,
         n_epochs=epochs,
         model_val_freq=model_val_freq,
+        log_every_batches=log_every_batches,
         lr=lr,
     )
 

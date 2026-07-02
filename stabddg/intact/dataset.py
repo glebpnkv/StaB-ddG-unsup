@@ -115,7 +115,6 @@ class IntactDataset(Dataset):
     def __init__(
         self,
         df_intact_path,
-        proteins_dir,
         assemblies_dir,
         max_length: int = 1024,
         k_neutral: int = 32,
@@ -123,7 +122,10 @@ class IntactDataset(Dataset):
         k_neg: int = 4,
         validate_wt: bool = True,
     ):
-        self.proteins_dir = proteins_dir
+        # NB: training reads structures only from ``assemblies_dir`` (the per-assembly safetensors).
+        # The AlphaFold monomers under ``proteins/`` are produced by the extraction pipeline and used
+        # by the offline WT oracle (stabddg/intact/validation.py), never here — so IntactDataset does
+        # not take a proteins_dir.
         self.assemblies_dir = assemblies_dir
         self.k_neutral = k_neutral
         self.k_pos = k_pos
