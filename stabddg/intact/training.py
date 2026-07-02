@@ -1,3 +1,5 @@
+import atexit
+import contextlib
 import logging
 import os
 
@@ -24,6 +26,110 @@ try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:
     SummaryWriter = None
+
+
+class _RunLogger:
+    """Best-effort experiment tracking to SageMaker Experiments and/or MLflow.
+
+    Both sinks are entirely optional and failure-tolerant: a run that has neither available logs to
+    neither and trains exactly as before. Used on the main process only.
+
+    * **SageMaker Experiments** — ``load_run()`` attaches to the run SageMaker auto-creates for the
+      training job (and, under Pipelines, the execution), so metrics show under Studio -> Experiments
+      with no standing infrastructure cost.
+    * **MLflow** — enabled only when ``MLFLOW_TRACKING_URI`` is set, so a cloud job never tries to
+      reach a server that isn't there. To track locally: ``mlflow ui`` (or a bare ``./mlruns`` file
+      store) and ``export MLFLOW_TRACKING_URI=http://127.0.0.1:5000`` before a local training run.
+    """
+
+    def __init__(self):
+        self._stack = contextlib.ExitStack()
+        self._sm_run = None
+        self._mlflow = None
+
+    def start(self, params: dict | None = None) -> "_RunLogger":
+        try:
+            from sagemaker.experiments.run import load_run
+
+            self._sm_run = self._stack.enter_context(load_run())
+            logger.info("SageMaker Experiments run attached")
+        except Exception as exc:  # not in SageMaker, SDK missing, no active run, etc.
+            logger.info("SageMaker Experiments unavailable (%s); skipping", exc)
+            self._sm_run = None
+
+        if os.environ.get("MLFLOW_TRACKING_URI"):
+            try:
+                import mlflow
+
+                self._mlflow = mlflow
+                self._stack.enter_context(mlflow.start_run(run_name=os.environ.get("MLFLOW_RUN_NAME")))
+                logger.info("MLflow run started (tracking_uri=%s)", os.environ["MLFLOW_TRACKING_URI"])
+            except Exception as exc:
+                logger.info("MLflow unavailable (%s); skipping", exc)
+                self._mlflow = None
+
+        atexit.register(self.close)
+        self.log_params(params or {})
+        return self
+
+    def log_params(self, params: dict):
+        if not params:
+            return
+        if self._sm_run is not None:
+            try:
+                self._sm_run.log_parameters({k: v for k, v in params.items()})
+            except Exception:
+                pass
+        if self._mlflow is not None:
+            try:
+                self._mlflow.log_params(params)
+            except Exception:
+                pass
+
+    def log_metrics(self, metrics: dict | None, step: int):
+        if not metrics:
+            return
+        for k, v in metrics.items():
+            fv = _maybe_float(v)
+            if fv is None:
+                continue
+            if self._sm_run is not None:
+                try:
+                    self._sm_run.log_metric(name=k, value=fv, step=step)
+                except Exception:
+                    pass
+            if self._mlflow is not None:
+                try:
+                    self._mlflow.log_metric(k, fv, step=step)
+                except Exception:
+                    pass
+
+    def close(self):
+        # ExitStack.close() is idempotent, so an explicit close + the atexit fallback are both safe.
+        self._stack.close()
+
+
+def _forward_neutrals(model, loss_fn, neutral_batch, ref: torch.Tensor) -> torch.Tensor:
+    """Forward the neutral contrast pool, but only with the autograd graph it actually needs.
+
+    Neutrals feed two things in ``ContrastiveLoss``: the (always-detached) robust centre/scale
+    statistics, and — only when ``lambda_neutral > 0`` — a neutral-regularisation term. So:
+      * ``lambda_neutral > 0``  -> forward WITH grad (the reg term needs it);
+      * normaliser on, λ == 0    -> forward under ``no_grad`` (stats are detached anyway);
+      * both off                 -> skip entirely, returning an empty ``(0,)`` tensor.
+
+    Skipping / no-grad-ing the neutral pool frees the activations of the *largest* contrast pool
+    (``k_neutral`` ≫ ``k_pos``/``k_neg``), which is the dominant lever against the high-k OOM.
+    ``ContrastiveLoss`` already handles an empty neutral tensor (numel == 0).
+    """
+    need_grad = getattr(loss_fn, "lambda_neutral", 0.0) > 0.0
+    need_neu = need_grad or getattr(loss_fn, "use_neutral_normalizer", False)
+    if not need_neu:
+        return ref.new_zeros(0)
+    if need_grad:
+        return _unwrap_model(model).fused_forward_intact_datapoint(neutral_batch)
+    with torch.no_grad():
+        return _unwrap_model(model).fused_forward_intact_datapoint(neutral_batch)
 
 
 def _maybe_float(value):
@@ -96,7 +202,7 @@ def train_step(
             z_anchor = _unwrap_model(model).fused_forward_intact_datapoint(batch)
             z_pos = _unwrap_model(model).fused_forward_intact_datapoint(batch_contrast["positive"])
             z_neg = _unwrap_model(model).fused_forward_intact_datapoint(batch_contrast["negative"])
-            z_neu = _unwrap_model(model).fused_forward_intact_datapoint(batch_contrast["neutral"])
+            z_neu = _forward_neutrals(model, loss_fn, batch_contrast["neutral"], z_anchor)
 
             z_sign = batch["sign"].to(z_anchor.device, non_blocking=True)
 
@@ -202,7 +308,7 @@ def validation_step(
                 z_anchor = _unwrap_model(model).fused_forward_intact_datapoint(batch)
                 z_pos = _unwrap_model(model).fused_forward_intact_datapoint(batch_contrast["positive"])
                 z_neg = _unwrap_model(model).fused_forward_intact_datapoint(batch_contrast["negative"])
-                z_neu = _unwrap_model(model).fused_forward_intact_datapoint(batch_contrast["neutral"])
+                z_neu = _forward_neutrals(model, loss_fn, batch_contrast["neutral"], z_anchor)
 
                 z_sign = batch["sign"].to(z_anchor.device, non_blocking=True)
 
@@ -390,6 +496,23 @@ def pretrain(
     else:
         logger.info("TensorBoard writer DISABLED (rank!=0 or no log dir)")
 
+    # Experiment tracking (SageMaker Experiments and/or MLflow); main process only, best-effort.
+    run_logger = (
+        _RunLogger().start(
+            {
+                "lr": lr,
+                "batch_size": batch_size,
+                "n_epochs": n_epochs,
+                "lambda_supcon": lambda_supcon,
+                "lambda_sign": lambda_sign,
+                "lambda_neutral": lambda_neutral,
+                "model_val_freq": model_val_freq,
+            }
+        )
+        if _is_main_process()
+        else None
+    )
+
     for epoch in tqdm(range(n_epochs), desc="Epoch"):
         # Reshuffle distinctly each epoch under DistributedSampler (no-op otherwise)
         if train_sampler is not None:
@@ -430,7 +553,11 @@ def pretrain(
                 "train",
                 epoch + 1,
             )
-            
+            if run_logger is not None:
+                run_logger.log_metrics({f"train/{k}": v for k, v in train_metrics.items()}, epoch + 1)
+                run_logger.log_metrics({"train/lr": optimizer.param_groups[0]["lr"]}, epoch + 1)
+
+
             # Potentially saving model checkpoint
             if (epoch + 1) % model_save_freq == 0:
                 logger.info(f"Saving model checkpoint at epoch {epoch + 1}")
@@ -467,6 +594,8 @@ def pretrain(
 
                 # Adding epoch validation metrics to TensorBoard
                 _log_epoch_metrics(tb_writer, valid_metrics, "validation", epoch + 1)
+                if run_logger is not None:
+                    run_logger.log_metrics({f"validation/{k}": v for k, v in valid_metrics.items()}, epoch + 1)
 
                 if use_wandb:
                     wandb.log(valid_metrics, step=epoch + 1)
@@ -503,6 +632,8 @@ def pretrain(
         df_forecasts = pd.concat([df_forecasts, df_forecasts_test], ignore_index=True)
 
         _log_epoch_metrics(tb_writer, test_metrics, "test", n_epochs)
+        if run_logger is not None:
+            run_logger.log_metrics({f"test/{k}": v for k, v in test_metrics.items()}, n_epochs)
 
         df_metrics.to_csv(os.path.join(metrics_save_dir, "metrics.csv"), index=False)
         df_forecasts.to_csv(os.path.join(metrics_save_dir, "forecasts.csv"), index=False)
@@ -516,3 +647,6 @@ def pretrain(
     if tb_writer is not None:
         tb_writer.flush()
         tb_writer.close()
+
+    if run_logger is not None:
+        run_logger.close()

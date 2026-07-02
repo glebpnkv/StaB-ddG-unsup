@@ -18,10 +18,8 @@ from rcsbapi.model import ModelQuery
 from rcsbapi.search import AttributeQuery, NestedAttributeQuery
 from requests.adapters import HTTPAdapter
 from safetensors.torch import save_file
-from tqdm import tqdm
 from urllib3.util.retry import Retry
 
-from stabddg.intact.uniprot import fetch_uniprot_sequences
 from stabddg.constants import (
     AA3_TO_1,
     ALPHABET,
@@ -30,6 +28,7 @@ from stabddg.constants import (
     SEQUENCE_UNKNOWN,
 )
 from stabddg.intact.uniprot import fetch_uniprot_sequences
+from stabddg.utils.progress import track
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -338,7 +337,7 @@ def fetch_alphafold_atoms_parallel(
         futs = {ex.submit(_task, code): code for code in uniprot_codes}
         iterator = as_completed(futs)
         if show_progress:
-            iterator = tqdm(iterator, total=len(futs), desc="AlphaFold fetch")
+            iterator = track(iterator, total=len(futs), desc="AlphaFold fetch")
         for fut in iterator:
             code, out = fut.result()
             results[code] = out
@@ -696,7 +695,7 @@ def fetch_assemblies_for_uniprots_parallel(
         futs = {ex.submit(_task, i, pair): i for i, pair in enumerate(uniprots_pairs)}
         iterator = as_completed(futs)
         if show_progress:
-            iterator = tqdm(iterator, total=len(futs), desc="Assemblies fetch")
+            iterator = track(iterator, total=len(futs), desc="Assemblies fetch")
         for fut in iterator:
             idx, (u1, u2), ranked = fut.result()
             if ranked is None or len(ranked) == 0:
@@ -1112,7 +1111,7 @@ def fetch_assemblies_atoms_parallel(
         futs = {ex.submit(_task, assembly): assembly for assembly in assemblies}
         iterator = as_completed(futs)
         if show_progress:
-            iterator = tqdm(iterator, total=len(futs), desc="Assemblies fetch")
+            iterator = track(iterator, total=len(futs), desc="Assemblies fetch")
         for fut in iterator:
             assembly_key, out = fut.result()
             results[assembly_key] = out

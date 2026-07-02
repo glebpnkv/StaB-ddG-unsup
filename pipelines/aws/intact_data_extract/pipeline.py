@@ -63,6 +63,9 @@ def build_pipeline() -> Pipeline:
             volume_size_in_gb=volume_size_gb,
             sagemaker_session=session,
             base_job_name=f"intact-{name}",
+            # Non-interactive container: silence tqdm so CloudWatch logs aren't spammed with
+            # carriage-return progress redraws. Local/notebook runs (no env var) keep their bars.
+            env={"TQDM_DISABLE": "1"},
             tags=config.DEFAULT_TAGS,
         )
 
@@ -164,7 +167,20 @@ def build_pipeline() -> Pipeline:
             code=RUN_STEP,
             inputs=[inp("assemblies", s3_out(select, "assemblies"))],
             outputs=[
-                out_published("assemblies_atoms", published("assemblies")),
+                # Publish ONLY the safetensors into training_data/assemblies/safetensors — that's all
+                # the training job loads. The per-assembly parquet atom-frames are an intermediate
+                # (used only to compute lengths during this step), so route them to the debug prefix
+                # rather than cluttering the training-ready bundle.
+                ProcessingOutput(
+                    output_name="assemblies_safetensors",
+                    source=f"{_CONTAINER_OUT}/assemblies_atoms/safetensors",
+                    destination=published("assemblies", "safetensors"),
+                ),
+                ProcessingOutput(
+                    output_name="assemblies_atoms_parquet",
+                    source=f"{_CONTAINER_OUT}/assemblies_atoms/parquet",
+                    destination=dest("fetch_atoms", "parquet"),
+                ),
                 out_published("assemblies_filtered", published()),
             ],
             arguments=["--step", "fetch_atoms", "--max-workers", assemblies_workers.to_string()],

@@ -2,14 +2,15 @@ import re
 from collections import defaultdict
 
 import requests
-from tqdm.auto import tqdm
+
+from stabddg.utils.progress import track
 
 BASE = "https://rest.uniprot.org"
 UA = {"User-Agent": "uniprot-bulk-fetch/1.0 (+python-requests)"}
 
 def _batched(xs: list[str], n:int = 50):
     buf = []
-    for x in tqdm(xs):
+    for x in track(xs, total=len(xs), desc="UniProt fetch"):
         x = x.strip()
         if not x:
             continue
@@ -74,7 +75,7 @@ def _fetch_pro_components(pro_ids, timeout=60):
             continue
         by_parent[acc].append(f"PRO_{pro}")
 
-    for acc, want in tqdm(by_parent.items()):
+    for acc, want in track(by_parent.items(), total=len(by_parent), desc="UniProt PRO components"):
         j = requests.get(f"{BASE}/uniprotkb/{acc}.json", headers=UA, timeout=timeout).json()
         full = j["sequence"]["value"]
         feats = j.get("features", [])

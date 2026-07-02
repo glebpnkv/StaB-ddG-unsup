@@ -16,8 +16,8 @@ from typing import Dict, Any, List
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from tqdm.auto import tqdm
 
+from stabddg.utils.progress import track
 from stabddg.intact.data import (
     IntactDataController,
     fetch_alphafold_atoms_parallel,
@@ -156,7 +156,7 @@ def fetch_and_summarize_assemblies_atoms(
 
     # Compute complex lengths from parquet outputs
     dict_lengths = {}
-    for k, v in tqdm(step_outcome_success.items(), desc="Compute assembly lengths"):
+    for k, v in track(step_outcome_success.items(), total=len(step_outcome_success), desc="Compute assembly lengths"):
         df_cur = pd.read_parquet(v["parquet_path"])  # expects columns [chain, resnum_label]
         dict_lengths[k] = df_cur.groupby(["chain", "resnum_label"]).ngroups
 

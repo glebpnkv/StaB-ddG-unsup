@@ -69,6 +69,22 @@ def build_pipeline() -> Pipeline:
         container_local_output_path="/opt/ml/output/tensorboard",
     )
 
+    # Scrape the per-epoch summary lines (training.py logs these via the module logger -> stdout ->
+    # CloudWatch; the per-batch lines only go to logs.txt). These surface in the training job's
+    # "Metrics" tab and as CloudWatch metrics. Format is e.g.
+    #   Epoch 3: Train metrics: {'loss_total': '0.1234', 'loss_supcon': '0.0000', ...}
+    metric_definitions = [
+        {"Name": "train:loss_total", "Regex": r"Train metrics: \{'loss_total': '([-0-9.]+)'"},
+        {"Name": "train:loss_supcon", "Regex": r"Train metrics: \{[^}]*'loss_supcon': '([-0-9.]+)'"},
+        {"Name": "train:loss_sign", "Regex": r"Train metrics: \{[^}]*'loss_sign': '([-0-9.]+)'"},
+        {"Name": "train:cos_pos_mean", "Regex": r"Train metrics: \{[^}]*'cos_pos_mean': '([-0-9.]+)'"},
+        {"Name": "train:cos_neg_mean", "Regex": r"Train metrics: \{[^}]*'cos_neg_mean': '([-0-9.]+)'"},
+        {"Name": "train:sign_violation_rate", "Regex": r"Train metrics: \{[^}]*'sign_violation_rate': '([-0-9.]+)'"},
+        {"Name": "validation:loss_total", "Regex": r"Validation metrics: \{'loss_total': '([-0-9.]+)'"},
+        {"Name": "validation:loss_supcon", "Regex": r"Validation metrics: \{[^}]*'loss_supcon': '([-0-9.]+)'"},
+        {"Name": "validation:sign_violation_rate", "Regex": r"Validation metrics: \{[^}]*'sign_violation_rate': '([-0-9.]+)'"},
+    ]
+
     estimator = PyTorch(
         image_uri=image,
         entry_point="intact_pretrain.py",
@@ -78,11 +94,12 @@ def build_pipeline() -> Pipeline:
         instance_count=1,
         sagemaker_session=session,
         base_job_name="intact-pretrain",
+        metric_definitions=metric_definitions,
         # Managed torchrun: launches one process per GPU on the node and sets RANK/WORLD_SIZE/LOCAL_RANK,
         # which jobs/intact_pretrain.py now uses to init the process group + DDP.
         distribution={"torch_distributed": {"enabled": True}},
         tensorboard_output_config=tb_output,
-        environment={"AIP_TENSORBOARD_LOG_DIR": "/opt/ml/output/tensorboard"},
+        environment={"AIP_TENSORBOARD_LOG_DIR": "/opt/ml/output/tensorboard", "TQDM_DISABLE": "1"},
         hyperparameters={
             "run_name": run_name,
             "data_dir": "/opt/ml/input/data/intact",
