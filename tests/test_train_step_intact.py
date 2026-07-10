@@ -108,3 +108,29 @@ def test_train_step_single_batch_with_detect_anomaly():
         assert key in metrics, f"missing metric {key}"
         assert math.isfinite(float(metrics[key])), f"metric {key} not finite: {metrics[key]}"
     assert len(df_forecasts) > 0
+
+
+def test_train_step_no_neutrals_pure_sign():
+    """The next-run config: k_neutral=0 (neutrals dropped) + pure sign loss + normaliser off.
+
+    Exercises the empty-neutral path end-to-end (sampler yields neutral=None, _forward_neutrals
+    returns empty, loss consumes an empty z_neu) and confirms a finite, SupCon-free loss.
+    """
+    device = torch.device("cpu")
+    model = _build_small_model(device)
+    ds = _build_dataset()
+    ds.k_neutral = 0  # drop the neutral pool entirely
+    dl, dl_contrastive = _build_loaders(ds)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    loss_fn = ContrastiveLoss(lambda_supcon=0.0, lambda_sign=1.0, lambda_neutral=0.0,
+                              use_neutral_normalizer=False)
+
+    metrics, df_forecasts = train_step(
+        model=model, dataloader=dl, dataloader_contrastive=dl_contrastive,
+        optimizer=optimizer, loss_fn=loss_fn, epoch=0, micro_batch_size=2,
+    )
+    assert math.isfinite(float(metrics["loss_total"]))
+    # lambda_supcon=0 -> total is exactly the (weighted) sign term
+    assert abs(float(metrics["loss_total"]) - float(metrics["loss_sign"])) < 1e-5
+    assert len(df_forecasts) > 0

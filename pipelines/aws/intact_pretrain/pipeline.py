@@ -24,10 +24,12 @@ from sagemaker.debugger import TensorBoardOutputConfig
 from sagemaker.inputs import TrainingInput
 from sagemaker.model import Model
 from sagemaker.pytorch import PyTorch
+from sagemaker.workflow.execution_variables import ExecutionVariables
 from sagemaker.workflow.functions import Join
 from sagemaker.workflow.model_step import ModelStep
 from sagemaker.workflow.parameters import ParameterFloat, ParameterInteger, ParameterString
 from sagemaker.workflow.pipeline import Pipeline
+from sagemaker.workflow.pipeline_experiment_config import PipelineExperimentConfig
 from sagemaker.workflow.steps import TrainingStep
 
 from pipelines.aws import config
@@ -48,31 +50,38 @@ def build_pipeline() -> Pipeline:
     data_uri = ParameterString("IntactDataS3Uri")  # s3 prefix with the intact/ layout
     instance_type = ParameterString("TrainingInstanceType", default_value="ml.g5.12xlarge")  # 4x A10G
     run_name = ParameterString("RunName", default_value="intact-pretrain")
-    epochs = ParameterInteger("Epochs", default_value=5)
+    epochs = ParameterInteger("Epochs", default_value=10)
     batch_size = ParameterInteger("BatchSize", default_value=2)
+    # DataLoader workers PER RANK. The contrastive stream builds k_pos+k_neg(+k_neutral) datapoints on
+    # CPU every step; with 1 worker the GPUs starve. g5.12xlarge has 48 vCPUs — feed them.
+    num_dataloader_workers = ParameterInteger("NumDataloaderWorkers", default_value=16)
     # If >0, forward each contrast pool in chunks of this many datapoints (concatenating outputs) to
-    # cap peak activation memory — lets larger k_* fit a fixed GPU. 0 = whole pool at once.
+    # cap peak activation memory — lets longer sequences / larger k_* fit a fixed GPU. 0 = whole pool.
     micro_batch_size = ParameterInteger("MicroBatchSize", default_value=2)
     # If 1, gradient-checkpoint the ProteinMPNN forward (recompute in backward) to also cap the
-    # backward-pass activation peak (~30% slower). Pairs with MicroBatchSize for large pools.
-    grad_checkpoint = ParameterInteger("GradCheckpoint", default_value=1)
+    # backward-pass peak (~30% slower). Off by default now that the neutral pool is gone (much lower
+    # memory); flip to 1 (with micro_batch_size) if a longer max_length OOMs.
+    grad_checkpoint = ParameterInteger("GradCheckpoint", default_value=0)
     # 768 keeps ~73% of SKEMPI eval mutations' length regime + recovers long IntAct positives.
     # Overridable at start-time (e.g. 1024 for ~98% SKEMPI coverage, with micro_batch_size=1).
     max_length = ParameterInteger("MaxLength", default_value=768)
     lr = ParameterFloat("LearningRate", default_value=1e-3)
-    # Each step runs k_pos + k_neg + k_neutral separate ProteinMPNN forwards PER RANK, so these drive
-    # per-GPU memory. 5/5/20 (the original target) fits an A10G (24 GB) at max_length=768 ONLY with the
-    # memory levers above (micro_batch_size + grad_checkpoint); without them use 4/4/8 or drop them.
-    k_neutral = ParameterInteger("KNeutral", default_value=20)
+    # Each step runs k_pos + k_neg + k_neutral separate ProteinMPNN forwards PER RANK. Neutrals only
+    # feed the (now-off) normaliser / neutral-reg term, so k_neutral=0 drops that whole pool — ~60%
+    # fewer forwards per step. Raise it only alongside UseNeutralNormalizer / LambdaNeutral > 0.
+    k_neutral = ParameterInteger("KNeutral", default_value=0)
     k_pos = ParameterInteger("KPos", default_value=5)
     k_neg = ParameterInteger("KNeg", default_value=5)
-    # >0 anchors the ΔΔG sign to the weak labels. With 0 the distance-based SupCon term is
-    # sign-invariant (z -> -z preserves all pairwise distances), so the direction is not identifiable
-    # from the loss and a falling loss does NOT certify a correct sign — hence a positive default.
+    # Loss weights. lambda_sign>0 anchors the ΔΔG sign to the weak labels — the meaningful signal (the
+    # distance-based SupCon term is sign-invariant on scalar z). lambda_supcon defaults to 0: start
+    # with a pure sign-direction objective (SupCon on 1-D ΔΔG with a ~2 valid-anchor batch was finicky
+    # and, with the normaliser, exploded — run 3mfdr02r6yg4). Add a small SupCon back once sign works.
+    lambda_supcon = ParameterFloat("LambdaSupcon", default_value=0.0)
     lambda_sign = ParameterFloat("LambdaSign", default_value=1.0)
     lambda_neutral = ParameterFloat("LambdaNeutral", default_value=0.0)
-    # Centre/scale ΔΔG by the neutral pool's robust median/MAD before the contrastive + sign terms.
-    use_neutral_normalizer = ParameterInteger("UseNeutralNormalizer", default_value=1)
+    # Neutral normaliser OFF by default: it divides z by the neutral MAD (~0.13, neutrals cluster near
+    # 0), inflating z_hat ~7x and blowing up / oscillating the SupCon loss. See run 3mfdr02r6yg4.
+    use_neutral_normalizer = ParameterInteger("UseNeutralNormalizer", default_value=0)
     model_val_freq = ParameterInteger("ModelValFreq", default_value=5)
     # Per-batch metrics to stdout every N batches (1 = every batch); per-epoch summaries always log.
     log_every_batches = ParameterInteger("LogEveryBatches", default_value=1)
@@ -110,6 +119,9 @@ def build_pipeline() -> Pipeline:
         instance_count=1,
         sagemaker_session=session,
         base_job_name="intact-pretrain",
+        # Hard wall-clock cap: SageMaker stops the job at this many seconds (model dir uploaded on
+        # stop). Keeps a debug run from over-running — 10 fast epochs should land well under this.
+        max_run=3600,
         metric_definitions=metric_definitions,
         # Managed torchrun: launches one process per GPU on the node and sets RANK/WORLD_SIZE/LOCAL_RANK,
         # which jobs/intact_pretrain.py now uses to init the process group + DDP.
@@ -124,6 +136,7 @@ def build_pipeline() -> Pipeline:
             "model_existing_checkpoint": "/app/model_ckpts/proteinmpnn.pt",
             "max_length": max_length,
             "batch_size": batch_size,
+            "num_dataloader_workers": num_dataloader_workers,
             "micro_batch_size": micro_batch_size,
             "grad_checkpoint": grad_checkpoint,
             "epochs": epochs,
@@ -131,6 +144,7 @@ def build_pipeline() -> Pipeline:
             "k_neutral": k_neutral,
             "k_pos": k_pos,
             "k_neg": k_neg,
+            "lambda_supcon": lambda_supcon,
             "lambda_sign": lambda_sign,
             "lambda_neutral": lambda_neutral,
             "use_neutral_normalizer": use_neutral_normalizer,
@@ -165,12 +179,21 @@ def build_pipeline() -> Pipeline:
         ),
     )
 
+    # Auto-create a SageMaker Experiment for the pipeline and a Trial per execution, so each run's
+    # jobs are associated and load_run() inside training attaches to them (-> Studio Experiments).
+    experiment_config = PipelineExperimentConfig(
+        experiment_name=PIPELINE_NAME,
+        trial_name=Join(on="-", values=[PIPELINE_NAME, ExecutionVariables.PIPELINE_EXECUTION_ID]),
+    )
+
     return Pipeline(
         name=PIPELINE_NAME,
+        pipeline_experiment_config=experiment_config,
         parameters=[
-            bucket, prefix, data_uri, instance_type, run_name, epochs, batch_size, micro_batch_size,
-            grad_checkpoint, max_length, lr, k_neutral, k_pos, k_neg, lambda_sign, lambda_neutral,
-            use_neutral_normalizer, model_val_freq, log_every_batches, approval,
+            bucket, prefix, data_uri, instance_type, run_name, epochs, batch_size,
+            num_dataloader_workers, micro_batch_size, grad_checkpoint, max_length, lr, k_neutral,
+            k_pos, k_neg, lambda_supcon, lambda_sign, lambda_neutral, use_neutral_normalizer,
+            model_val_freq, log_every_batches, approval,
         ],
         steps=[train_step, register_step],
         sagemaker_session=session,

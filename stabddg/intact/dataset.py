@@ -512,13 +512,6 @@ class IntactDataset(Dataset):
             replace=True  # Safety
         ).index
 
-        sample_neutral = self.df.loc[
-            self.df["feature_type"].isin(self.feature_type_neutral)
-        ].sample(
-            self.k_neutral,
-            replace=True  # Safety
-        ).index
-
         out_pos = self._combine_items(
             items=[self._fetch(x) for x in sample_pos]
         )
@@ -526,10 +519,22 @@ class IntactDataset(Dataset):
         out_neg = self._combine_items(
             items=[self._fetch(x) for x in sample_neg]
         )
-        # Getting "neutral" datapoints
-        out_neutral = self._combine_items(
-            items=[self._fetch(x) for x in sample_neutral]
-        )
+
+        # Neutrals only feed the (optional) neutral normaliser / neutral-reg term. When k_neutral == 0
+        # (normaliser off + lambda_neutral == 0) skip sampling + fetching them entirely — no wasted disk
+        # loads or forwards. ``None`` flows through the stream; _forward_neutrals treats it as "skip".
+        if self.k_neutral > 0:
+            sample_neutral = self.df.loc[
+                self.df["feature_type"].isin(self.feature_type_neutral)
+            ].sample(
+                self.k_neutral,
+                replace=True  # Safety
+            ).index
+            out_neutral = self._combine_items(
+                items=[self._fetch(x) for x in sample_neutral]
+            )
+        else:
+            out_neutral = None
 
         return out_pos, out_neg, out_neutral
 

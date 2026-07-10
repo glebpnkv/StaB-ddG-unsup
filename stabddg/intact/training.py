@@ -49,10 +49,21 @@ class _RunLogger:
 
     def start(self, params: dict | None = None) -> "_RunLogger":
         try:
+            import boto3
+            import sagemaker
             from sagemaker.experiments.run import load_run
 
-            self._sm_run = self._stack.enter_context(load_run())
-            logger.info("SageMaker Experiments run attached")
+            # Build a region-aware session explicitly: inside the training container the default
+            # boto session often has no region, which makes load_run() raise "Must setup local AWS
+            # configuration with a region". SageMaker sets AWS_REGION/AWS_DEFAULT_REGION on the job.
+            region = (
+                os.environ.get("AWS_REGION")
+                or os.environ.get("AWS_DEFAULT_REGION")
+                or boto3.session.Session().region_name
+            )
+            sm_session = sagemaker.Session(boto_session=boto3.session.Session(region_name=region))
+            self._sm_run = self._stack.enter_context(load_run(sagemaker_session=sm_session))
+            logger.info("SageMaker Experiments run attached (region=%s)", region)
         except Exception as exc:  # not in SageMaker, SDK missing, no active run, etc.
             logger.info("SageMaker Experiments unavailable (%s); skipping", exc)
             self._sm_run = None
@@ -164,7 +175,9 @@ def _forward_neutrals(model, loss_fn, neutral_batch, ref: torch.Tensor, micro_ba
     """
     need_grad = getattr(loss_fn, "lambda_neutral", 0.0) > 0.0
     need_neu = need_grad or getattr(loss_fn, "use_neutral_normalizer", False)
-    if not need_neu:
+    # neutral_batch is None when the sampler skips neutrals (k_neutral == 0); an empty dict is also
+    # treated as "nothing to forward". Either way, and whenever neutrals aren't needed, return empty.
+    if not need_neu or not neutral_batch:
         return ref.new_zeros(0)
     if need_grad:
         return _microbatched_forward(model, neutral_batch, micro_batch_size)

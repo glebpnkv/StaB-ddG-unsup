@@ -13,7 +13,8 @@ COPY . .
 RUN pip install -e .
 
 # SageMaker Python SDK so the training script can attach to SageMaker Experiments via load_run()
-# (the DLC ships only the training toolkit, not the full SDK). The MLflow sink in training.py stays
-# dormant unless MLFLOW_TRACKING_URI is set, so mlflow is intentionally NOT installed here — track
-# with MLflow locally instead (mlflow ui + MLFLOW_TRACKING_URI on a local run).
-RUN pip install "sagemaker>=2.220,<3"
+# (the DLC ships only the training toolkit, not the full SDK), plus tensorboard so the SummaryWriter
+# actually emits event files (without it training.py logs "SummaryWriter available: False" and writes
+# nothing). The MLflow sink in training.py stays dormant unless MLFLOW_TRACKING_URI is set, so mlflow
+# is intentionally NOT installed here — track with MLflow locally instead.
+RUN pip install "sagemaker>=2.220,<3" tensorboard

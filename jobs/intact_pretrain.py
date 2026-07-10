@@ -76,6 +76,13 @@ if __name__ == "__main__":
     )
 
     argparser.add_argument(
+        "--lambda_supcon",
+        type=float,
+        default=0.0,
+        help="Weight for the supervised-contrastive term. 0 = pure sign-direction objective (SupCon on "
+             "scalar ΔΔG is finicky); raise once the sign is learning."
+    )
+    argparser.add_argument(
         "--lambda_sign",
         type=float,
         default=1.0,
@@ -168,6 +175,7 @@ if __name__ == "__main__":
         epochs=args.epochs,
         lr=args.lr,
         noise_level=args.noise_level,
+        lambda_supcon=args.lambda_supcon,
         lambda_sign=args.lambda_sign,
         lambda_neutral=args.lambda_neutral,
         use_neutral_normalizer=bool(args.use_neutral_normalizer),
