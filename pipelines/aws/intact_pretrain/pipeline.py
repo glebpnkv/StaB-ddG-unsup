@@ -211,6 +211,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=["upsert", "run"])
     parser.add_argument("--data-uri", help="S3 prefix with the intact/ data layout (required for run)")
+    # Override any pipeline parameter at launch, repeatable, e.g. `--param Epochs=1 --param
+    # RunTag=b-baseline`. Values go on the wire as strings (SageMaker coerces to the param's type), so a
+    # bare `--param Epochs=1` is fine. Lets one upserted definition drive the A/B runs (and this smoke)
+    # without editing defaults.
+    parser.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
+                        help="Override a pipeline parameter (repeatable).")
     args = parser.parse_args()
 
     pipeline = build_pipeline()
@@ -219,8 +225,17 @@ def main():
     if args.action == "run":
         if not args.data_uri:
             parser.error("--data-uri is required for run")
-        execution = pipeline.start(parameters={"IntactDataS3Uri": args.data_uri})
+        overrides = {}
+        for item in args.param:
+            if "=" not in item:
+                parser.error(f"--param must be KEY=VALUE, got {item!r}")
+            key, value = item.split("=", 1)
+            overrides[key.strip()] = value.strip()
+        parameters = {"IntactDataS3Uri": args.data_uri, **overrides}
+        execution = pipeline.start(parameters=parameters)
         print(f"Started execution: {execution.arn}")
+        if overrides:
+            print(f"Parameter overrides: {overrides}")
 
 
 if __name__ == "__main__":
