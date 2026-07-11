@@ -6,7 +6,7 @@ The AWS counterpart of `pipelines/gcp/`. Same workloads, expressed with **SageMa
 | Pipeline | GCP equivalent | Status |
 |----------|----------------|--------|
 | `intact_data_extract` | `pipelines/gcp/intact_data_extract` | ✅ implemented + smoke-tested on SageMaker |
-| `intact_pretrain` (multi-GPU training) | `pipelines/gcp/intact_pretrain` | ✅ implemented (not yet run) |
+| `intact_pretrain` (multi-GPU training) | `pipelines/gcp/intact_pretrain` | ✅ implemented + run (4× GPU) |
 | `skempi_eval` | `pipelines/gcp/skempi_eval` | ⏳ planned |
 
 ## One-time setup
@@ -60,7 +60,7 @@ DOCKERFILE=containers/Dockerfile.sagemaker.gpu TAG=gpu ALIAS_TAG=gpu ./scripts/b
 export PIPELINE_IMAGE_TAG=gpu
 
 # 2. Register + run (point --data-uri at an S3 prefix holding the intact/ layout:
-#    proteins/safetensors/, assemblies/safetensors/, df_intact_mutations_filtered.parquet, ...)
+#    assemblies/safetensors/, df_intact_mutations_filtered.parquet, df_assemblies_filtered.parquet)
 python -m pipelines.aws.intact_pretrain.pipeline run --data-uri s3://<bucket>/<prefix>/intact
 ```
 
@@ -70,9 +70,48 @@ group and wraps the model in DDP), with TensorBoard synced to S3, model artifact
 `/opt/ml/model`, then a **`RegisterModel`** step that records the result in the SageMaker **Model
 Registry** (group `stab-ddg-intact-pretrain`).
 
+The training data is `DistributedSampler`-sharded across the 4 GPUs: each rank processes ~1/4 of the
+train anchors per epoch (≈410 batches/rank at `batch_size=2` for the ~3.3k-anchor set) and metrics
+are `all_reduce`-averaged — one full pass per epoch, not one-per-GPU. The `k_pos`/`k_neg` contrastive
+pool is sampled per-rank (it class-balances the ~4%-positive anchors), not an extra epoch pass.
+
+### Launch-time overrides + A/B runs
+Any pipeline parameter can be overridden at launch with repeatable `--param KEY=VALUE`, so one
+upserted definition drives every run. Tag each run so it self-labels in tracking:
+```bash
+# A/B ablation as two labelled runs
+python -m pipelines.aws.intact_pretrain.pipeline run --data-uri s3://<bucket>/<prefix>/intact \
+  --param RunTag=b-baseline
+python -m pipelines.aws.intact_pretrain.pipeline run --data-uri s3://<bucket>/<prefix>/intact \
+  --param RunTag=a-balanced-sampler
+# quick smoke: --param Epochs=1 --param RunTag=test-smoke
+```
+
+### Viewing metrics (TensorBoard + CloudWatch — no standing cost)
+Training logs a clean, tqdm-free `Epoch X/Y: Batch i/N ... metrics: {...}` line per batch, plus
+per-epoch summaries. Two free ways to see the curves:
+
+- **TensorBoard** (full step + epoch scalars). SageMaker syncs event files to the
+  `TensorBoardOutputConfig` path — note this is **not** the job-output prefix:
+  ```bash
+  # <job> = pipelines-<execid>-IntactPretrain-<suffix>
+  aws s3 sync s3://<bucket>/<prefix>/intact_pretrain/tensorboard/<job>/ /tmp/tb/<job>/
+  tensorboard --logdir /tmp/tb          # sync several <job>/ dirs under /tmp/tb to overlay A vs B
+  ```
+- **Training job Metrics tab / CloudWatch** — `metric_definitions` scrapes the summary lines into
+  named metrics (`train:loss_sign`, `train:sign_violation_rate`, …), comparable across jobs.
+
+> **Why Studio's "Experiments" panel looks empty:** that panel is **MLflow-backed** and needs an
+> MLflow *tracking server* (an AWS-managed one bills ~$0.64/hr while it exists), which we deliberately
+> don't run. `PipelineExperimentConfig` still creates a classic SageMaker Experiment + Trial per
+> execution (visible via `aws sagemaker list-trials`, and how the trial name carries `RunTag`), but
+> the new Studio UI doesn't surface classic experiments in that nav. Use TensorBoard + the Metrics
+> tab above. The `SageMaker Experiments unavailable ...; skipping` log line is expected and benign.
+
 ### SageMaker features used
 - Managed **multi-GPU** training (`distribution={"torch_distributed": {"enabled": True}}`).
 - **TensorBoard → S3** via `TensorBoardOutputConfig`.
+- **CloudWatch metrics** via `metric_definitions` (per-epoch + per-batch scalars).
 - **Model Registry** versioning with an approval gate (`ModelApprovalStatus`).
 
 > The training data channel expects a single S3 prefix with the `intact/` layout. The
