@@ -50,6 +50,10 @@ pytorch_cpu = [
 pytorch_cuda = [
   "torch>=2.6.0",
 ]
+aws = [
+    "boto3>=1.43.46",
+    "sagemaker>=2.220,<3",
+]
 
 [tool.uv]
 conflicts = [
