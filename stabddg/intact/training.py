@@ -238,6 +238,7 @@ def train_step(
     optimizer: torch.optim.Optimizer,
     loss_fn: ContrastiveLoss,
     epoch: int,
+    n_epochs: int = 0,
     output_logger = logger,
     grad_accum_steps: int = 1,
     amp_dtype: torch.dtype = default_amp_dtype,
@@ -252,7 +253,8 @@ def train_step(
         scaler = GradScaler(enabled=torch.cuda.is_available() and amp_dtype == torch.float16)
         train_step._scaler = scaler
     optimizer.zero_grad(set_to_none=True)
-    print_prefix = f"Epoch {epoch + 1}"
+    # e.g. "Epoch 3/10" when n_epochs is known, else "Epoch 3" (direct-call fallback).
+    print_prefix = f"Epoch {epoch + 1}/{n_epochs}" if n_epochs else f"Epoch {epoch + 1}"
 
     df_forecasts = pd.DataFrame()
     all_train_metrics = None
@@ -310,7 +312,7 @@ def train_step(
             pbar.set_description(f"Train Batch {i + 1}")
             pbar.set_postfix(metrics)
             batch_line = (
-                f'{print_prefix}: Batch {i + 1} Train metrics: '
+                f'{print_prefix}: Batch {i + 1}/{n_batches} Train metrics: '
                 f'{ {k: "{0:0.4f}".format(v) for k, v in metrics.items() if v is not None} }'
             )
             # Full per-batch record to logs.txt; throttled copy to stdout so CloudWatch (and
@@ -363,6 +365,7 @@ def validation_step(
     dataloader_contrastive: DataLoader,
     loss_fn: ContrastiveLoss,
     epoch: int,
+    n_epochs: int = 0,
     step_name: str = "Validation",
     output_logger = logger,
     amp_dtype: torch.dtype = default_amp_dtype,
@@ -371,7 +374,7 @@ def validation_step(
     log_every_batches: int = 1,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     _unwrap_model(model).eval()
-    print_prefix = f"Epoch {epoch + 1}"
+    print_prefix = f"Epoch {epoch + 1}/{n_epochs}" if n_epochs else f"Epoch {epoch + 1}"
 
     df_forecasts = pd.DataFrame()
     all_metrics = None
@@ -411,7 +414,7 @@ def validation_step(
                     pbar.set_description(f"{step_name} Batch {i + 1}")
                     pbar.set_postfix(metrics)
                 batch_line = (
-                    f'{print_prefix}: Batch {i + 1} {step_name} metrics: '
+                    f'{print_prefix}: Batch {i + 1}/{n_batches} {step_name} metrics: '
                     f'{ {k: "{0:0.4f}".format(v) for k, v in metrics.items() if v is not None} }'
                 )
                 output_logger.info(batch_line)
@@ -618,6 +621,7 @@ def pretrain(
             optimizer=optimizer,
             loss_fn=loss_fn,
             epoch=epoch,
+            n_epochs=n_epochs,
             grad_accum_steps=grad_accum_steps,
             output_logger=logger_file,
             tb_writer=tb_writer,
@@ -628,7 +632,7 @@ def pretrain(
         # Collecting metrics from the training step
         if _is_main_process():
             logger.info(
-                f'Epoch {epoch + 1}: Train metrics: '
+                f'Epoch {epoch + 1}/{n_epochs}: Train metrics: '
                 f'{ {k: "{0:0.4f}".format(v) for k, v in train_metrics.items() if v is not None} }'
             )
 
@@ -668,6 +672,7 @@ def pretrain(
                 dataloader_contrastive=dl_contrastive,
                 loss_fn=loss_fn,
                 epoch=epoch,
+                n_epochs=n_epochs,
                 output_logger=logger_file,
                 step_name="Validation",
                 tb_writer=tb_writer,
@@ -677,7 +682,7 @@ def pretrain(
 
             if _is_main_process():
                 logger.info(
-                    f'Epoch {epoch + 1}: Validation metrics: '
+                    f'Epoch {epoch + 1}/{n_epochs}: Validation metrics: '
                     f'{ {k: "{0:0.4f}".format(v) for k, v in valid_metrics.items() if v is not None} }'
                 )
 
@@ -702,14 +707,19 @@ def pretrain(
             df_metrics.to_csv(os.path.join(metrics_save_dir, "metrics.csv"), index=False)
             df_forecasts.to_csv(os.path.join(metrics_save_dir, "forecasts.csv"), index=False)
 
-    # Calculating the test metrics at the end of the training loop
-    logger.info("Calculating test metrics at the end of the training loop")
+    # Calculating the test metrics at the end of the training loop. Test belongs to the final epoch,
+    # so pass the 0-indexed last epoch (n_epochs - 1): validation_step prints "Epoch {n_epochs}/...",
+    # matching the summary line below (which used the leaked loop var epoch + 1 == n_epochs). Passing
+    # n_epochs directly made the per-batch lines read one epoch ahead of the summary.
+    if _is_main_process():
+        logger.info("Calculating test metrics at the end of the training loop")
     test_metrics, df_forecasts_test = validation_step(
         model=model,
         dataloader=dl_test,
         dataloader_contrastive=dl_contrastive,
         loss_fn=loss_fn,
-        epoch=n_epochs,
+        epoch=max(n_epochs - 1, 0),
+        n_epochs=n_epochs,
         step_name="Test",
         output_logger=logger_file,
         micro_batch_size=micro_batch_size,
@@ -718,7 +728,7 @@ def pretrain(
 
     if _is_main_process():
         logger.info(
-            f'Epoch {epoch + 1}: Test metrics: '
+            f'Epoch {epoch + 1}/{n_epochs}: Test metrics: '
             f'{ {k: "{0:0.4f}".format(v) for k, v in test_metrics.items() if v is not None} }'
         )
 

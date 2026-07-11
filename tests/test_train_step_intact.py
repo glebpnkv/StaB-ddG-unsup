@@ -16,7 +16,7 @@ from stabddg.intact.dataset import (
     passthrough_collate_fn,
 )
 from stabddg.intact.losses import ContrastiveLoss
-from stabddg.intact.training import train_step
+from stabddg.intact.training import train_step, validation_step
 from stabddg.model import StaBddG
 from stabddg.mpnn_utils import ProteinMPNN
 
@@ -134,3 +134,35 @@ def test_train_step_no_neutrals_pure_sign():
     # lambda_supcon=0 -> total is exactly the (weighted) sign term
     assert abs(float(metrics["loss_total"]) - float(metrics["loss_sign"])) < 1e-5
     assert len(df_forecasts) > 0
+
+
+def test_test_step_epoch_label_matches_summary(caplog):
+    """Regression: the Test per-batch epoch label must equal the epoch the summary reports.
+
+    pretrain() runs the final test pass as validation_step(epoch=n_epochs-1, n_epochs=n_epochs), so
+    the per-batch lines read "Epoch {n_epochs}/{n_epochs}" — the same epoch as the summary. A prior
+    bug passed epoch=n_epochs, making the per-batch lines read "Epoch {n_epochs+1}" (off by one).
+    Also pins the "Epoch X/Y" and "Batch i/N" progress format.
+    """
+    import logging
+    import re
+
+    device = torch.device("cpu")
+    model = _build_small_model(device)
+    ds = _build_dataset()
+    anchor, contrastive = _build_loaders(ds)
+    loss_fn = ContrastiveLoss(lambda_supcon=0.0, lambda_sign=1.0)
+
+    n_epochs = 2
+    with caplog.at_level(logging.INFO, logger="stabddg.intact.training"):
+        validation_step(
+            model=model, dataloader=anchor, dataloader_contrastive=contrastive,
+            loss_fn=loss_fn, epoch=max(n_epochs - 1, 0), n_epochs=n_epochs, step_name="Test",
+        )
+
+    batch_lines = [r.message for r in caplog.records
+                   if "Test metrics" in r.message and "Batch" in r.message]
+    assert batch_lines, "no per-batch Test metric lines were captured"
+    for line in batch_lines:
+        assert re.search(rf"Epoch {n_epochs}/{n_epochs}: Batch \d+/\d+ Test metrics", line), line
+        assert f"Epoch {n_epochs + 1}" not in line
