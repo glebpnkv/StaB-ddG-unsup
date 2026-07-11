@@ -50,7 +50,12 @@ def build_pipeline() -> Pipeline:
     data_uri = ParameterString("IntactDataS3Uri")  # s3 prefix with the intact/ layout
     instance_type = ParameterString("TrainingInstanceType", default_value="ml.g5.12xlarge")  # 4x A10G
     run_name = ParameterString("RunName", default_value="intact-pretrain")
+    # Short human label baked into the experiment trial name so runs are self-identifying in Studio
+    # Experiments (e.g. RunTag=b-baseline vs RunTag=a-balanced-sampler for the A/B comparison).
+    run_tag = ParameterString("RunTag", default_value="run")
     epochs = ParameterInteger("Epochs", default_value=10)
+    # Kept at the last known-good value. NB raising batch_size dilutes the pool's class-balancing
+    # (more imbalanced anchors per fixed k_pos/k_neg), so scale k_pos with it or balance the sampler.
     batch_size = ParameterInteger("BatchSize", default_value=2)
     # DataLoader workers PER RANK. The contrastive stream builds k_pos+k_neg(+k_neutral) datapoints on
     # CPU every step; with 1 worker the GPUs starve. g5.12xlarge has 48 vCPUs — feed them.
@@ -66,9 +71,10 @@ def build_pipeline() -> Pipeline:
     # Overridable at start-time (e.g. 1024 for ~98% SKEMPI coverage, with micro_batch_size=1).
     max_length = ParameterInteger("MaxLength", default_value=768)
     lr = ParameterFloat("LearningRate", default_value=1e-3)
-    # Each step runs k_pos + k_neg + k_neutral separate ProteinMPNN forwards PER RANK. Neutrals only
-    # feed the (now-off) normaliser / neutral-reg term, so k_neutral=0 drops that whole pool — ~60%
-    # fewer forwards per step. Raise it only alongside UseNeutralNormalizer / LambdaNeutral > 0.
+    # Contrast pools: each pool item is a ProteinMPNN forward PER RANK. The pos/neg pools are NOT
+    # redundant even at lambda_supcon=0 — they CLASS-BALANCE the sign loss: anchors are only ~4% positive
+    # (139 vs 3146), so k_pos guarantees positive-direction signal every step (else ~half of batches see
+    # zero positives). Keep k_pos≈k_neg>0. Neutrals feed only the (off) normaliser, so k_neutral stays 0.
     k_neutral = ParameterInteger("KNeutral", default_value=0)
     k_pos = ParameterInteger("KPos", default_value=5)
     k_neg = ParameterInteger("KNeg", default_value=5)
@@ -120,8 +126,9 @@ def build_pipeline() -> Pipeline:
         sagemaker_session=session,
         base_job_name="intact-pretrain",
         # Hard wall-clock cap: SageMaker stops the job at this many seconds (model dir uploaded on
-        # stop). Keeps a debug run from over-running — 10 fast epochs should land well under this.
-        max_run=3600,
+        # stop). 9000s (~2.5h, ~$14 on g6) covers 10 epochs of the known-good bs=2/k=5/5 config; the
+        # faster balanced-sampler variant finishes well under it and stops on its own.
+        max_run=9000,
         metric_definitions=metric_definitions,
         # Managed torchrun: launches one process per GPU on the node and sets RANK/WORLD_SIZE/LOCAL_RANK,
         # which jobs/intact_pretrain.py now uses to init the process group + DDP.
@@ -183,14 +190,14 @@ def build_pipeline() -> Pipeline:
     # jobs are associated and load_run() inside training attaches to them (-> Studio Experiments).
     experiment_config = PipelineExperimentConfig(
         experiment_name=PIPELINE_NAME,
-        trial_name=Join(on="-", values=[PIPELINE_NAME, ExecutionVariables.PIPELINE_EXECUTION_ID]),
+        trial_name=Join(on="-", values=[PIPELINE_NAME, run_tag, ExecutionVariables.PIPELINE_EXECUTION_ID]),
     )
 
     return Pipeline(
         name=PIPELINE_NAME,
         pipeline_experiment_config=experiment_config,
         parameters=[
-            bucket, prefix, data_uri, instance_type, run_name, epochs, batch_size,
+            bucket, prefix, data_uri, instance_type, run_name, run_tag, epochs, batch_size,
             num_dataloader_workers, micro_batch_size, grad_checkpoint, max_length, lr, k_neutral,
             k_pos, k_neg, lambda_supcon, lambda_sign, lambda_neutral, use_neutral_normalizer,
             model_val_freq, log_every_batches, approval,

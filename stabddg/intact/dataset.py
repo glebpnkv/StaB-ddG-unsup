@@ -497,44 +497,22 @@ class IntactDataset(Dataset):
         return out
 
     def _sample(self):
-        # Sampling positive values
-        sample_pos = self.df.loc[
-            self.df["feature_type"].isin(self.feature_type_pos)
-        ].sample(
-            self.k_pos,
-            replace=True  # Safety
-        ).index
-
-        sample_neg = self.df.loc[
-            self.df["feature_type"].isin(self.feature_type_neg)
-        ].sample(
-            self.k_neg,
-            replace=True  # Safety
-        ).index
-
-        out_pos = self._combine_items(
-            items=[self._fetch(x) for x in sample_pos]
-        )
-        # Getting "opposite" datapoints
-        out_neg = self._combine_items(
-            items=[self._fetch(x) for x in sample_neg]
-        )
-
-        # Neutrals only feed the (optional) neutral normaliser / neutral-reg term. When k_neutral == 0
-        # (normaliser off + lambda_neutral == 0) skip sampling + fetching them entirely — no wasted disk
-        # loads or forwards. ``None`` flows through the stream; _forward_neutrals treats it as "skip".
-        if self.k_neutral > 0:
-            sample_neutral = self.df.loc[
-                self.df["feature_type"].isin(self.feature_type_neutral)
-            ].sample(
-                self.k_neutral,
-                replace=True  # Safety
+        # A pool with k == 0 is skipped entirely (no sampling / disk loads / forwards) and flows
+        # through as None; the training forward treats None as "empty pool" and the loss handles it.
+        # With lambda_supcon == 0 the pos/neg pools are redundant with the labelled anchors (both only
+        # feed the sign loss), so k_pos = k_neg = 0 removes ~all the per-step pool cost. Neutrals feed
+        # only the (optional) normaliser / neutral-reg term.
+        def _sample_pool(feature_types, k):
+            if k <= 0:
+                return None
+            idx = self.df.loc[self.df["feature_type"].isin(feature_types)].sample(
+                k, replace=True  # Safety
             ).index
-            out_neutral = self._combine_items(
-                items=[self._fetch(x) for x in sample_neutral]
-            )
-        else:
-            out_neutral = None
+            return self._combine_items(items=[self._fetch(x) for x in idx])
+
+        out_pos = _sample_pool(self.feature_type_pos, self.k_pos)
+        out_neg = _sample_pool(self.feature_type_neg, self.k_neg)
+        out_neutral = _sample_pool(self.feature_type_neutral, self.k_neutral)
 
         return out_pos, out_neg, out_neutral
 

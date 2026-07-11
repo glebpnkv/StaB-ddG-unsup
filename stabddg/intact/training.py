@@ -160,6 +160,16 @@ def _microbatched_forward(model, batch: dict, micro_batch_size: int) -> torch.Te
     return torch.cat(outs, dim=0)
 
 
+def _forward_pool(model, pool_batch, micro_batch_size: int, ref: torch.Tensor) -> torch.Tensor:
+    """Forward a grad-requiring contrast pool (positives/negatives), or return an empty ``(0,)`` tensor
+    when the pool is skipped (``k == 0`` -> sampler yields None). With ``lambda_supcon == 0`` the pos/neg
+    pools are redundant with the labelled anchors, so dropping them removes ~all per-step pool cost;
+    ``ContrastiveLoss`` handles the resulting empty ``z_pos``/``z_neg``."""
+    if not pool_batch:
+        return ref.new_zeros(0)
+    return _microbatched_forward(model, pool_batch, micro_batch_size)
+
+
 def _forward_neutrals(model, loss_fn, neutral_batch, ref: torch.Tensor, micro_batch_size: int = 0) -> torch.Tensor:
     """Forward the neutral contrast pool, but only with the autograd graph it actually needs.
 
@@ -183,6 +193,17 @@ def _forward_neutrals(model, loss_fn, neutral_batch, ref: torch.Tensor, micro_ba
         return _microbatched_forward(model, neutral_batch, micro_batch_size)
     with torch.no_grad():
         return _microbatched_forward(model, neutral_batch, micro_batch_size)
+
+
+def _bars_disabled() -> bool:
+    """Whether to disable tqdm bars: on non-main ranks, or whenever TQDM_DISABLE is set (pipeline runs).
+
+    Passing ``disable=not _is_main_process()`` explicitly (as the loops did) is a hard False on the main
+    rank, which OVERRIDES the ``TQDM_DISABLE`` env var — that's why the carriage-return bars kept
+    leaking into CloudWatch. Folding the env check in here restores the intended behaviour; the
+    per-batch ``logger.info`` metric lines remain the clean, parseable log signal.
+    """
+    return (not _is_main_process()) or bool(os.environ.get("TQDM_DISABLE"))
 
 
 def _maybe_float(value):
@@ -238,7 +259,7 @@ def train_step(
 
     i = 0
     n_batches = len(dataloader)
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False, disable=not _is_main_process())
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False, disable=_bars_disabled())
 
     # Persistent iterator over the (infinite) contrastive stream: calling iter() on every batch
     # would restart the DataLoader workers and always return the very first sampled pool.
@@ -255,9 +276,10 @@ def train_step(
 
         with autocast(device_type="cuda", dtype=amp_dtype, enabled=torch.cuda.is_available()):
             # Fused per-pool forward, optionally micro-batched to cap peak activation memory.
+            # pos/neg are skipped (empty) when k_pos/k_neg == 0 (redundant with anchors at supcon=0).
             z_anchor = _microbatched_forward(model, batch, micro_batch_size)
-            z_pos = _microbatched_forward(model, batch_contrast["positive"], micro_batch_size)
-            z_neg = _microbatched_forward(model, batch_contrast["negative"], micro_batch_size)
+            z_pos = _forward_pool(model, batch_contrast["positive"], micro_batch_size, z_anchor)
+            z_neg = _forward_pool(model, batch_contrast["negative"], micro_batch_size, z_anchor)
             z_neu = _forward_neutrals(model, loss_fn, batch_contrast["neutral"], z_anchor, micro_batch_size)
 
             z_sign = batch["sign"].to(z_anchor.device, non_blocking=True)
@@ -356,7 +378,7 @@ def validation_step(
     i = 0
     n_batches = len(dataloader)
     with torch.no_grad(), autocast(device_type="cuda", dtype=amp_dtype, enabled=torch.cuda.is_available()):
-        pbar = tqdm(dataloader, desc=f"{step_name} Epoch {epoch}", leave=False, disable=not _is_main_process())
+        pbar = tqdm(dataloader, desc=f"{step_name} Epoch {epoch}", leave=False, disable=_bars_disabled())
         contrast_iter = iter(dataloader_contrastive)
         for batch in pbar:
             # Fetching a fresh sample of contrastive datapoints
@@ -368,9 +390,10 @@ def validation_step(
 
             with autocast(device_type="cuda", dtype=amp_dtype, enabled=torch.cuda.is_available()):
                 # Fused per-pool forward, optionally micro-batched to cap peak activation memory.
+                # pos/neg are skipped (empty) when k_pos/k_neg == 0 (redundant with anchors at supcon=0).
                 z_anchor = _microbatched_forward(model, batch, micro_batch_size)
-                z_pos = _microbatched_forward(model, batch_contrast["positive"], micro_batch_size)
-                z_neg = _microbatched_forward(model, batch_contrast["negative"], micro_batch_size)
+                z_pos = _forward_pool(model, batch_contrast["positive"], micro_batch_size, z_anchor)
+                z_neg = _forward_pool(model, batch_contrast["negative"], micro_batch_size, z_anchor)
                 z_neu = _forward_neutrals(model, loss_fn, batch_contrast["neutral"], z_anchor, micro_batch_size)
 
                 z_sign = batch["sign"].to(z_anchor.device, non_blocking=True)
@@ -582,7 +605,7 @@ def pretrain(
         else None
     )
 
-    for epoch in tqdm(range(n_epochs), desc="Epoch"):
+    for epoch in tqdm(range(n_epochs), desc="Epoch", disable=_bars_disabled()):
         # Reshuffle distinctly each epoch under DistributedSampler (no-op otherwise)
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
