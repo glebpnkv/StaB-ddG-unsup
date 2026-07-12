@@ -51,26 +51,32 @@ class PPIDataset(Dataset):
                 split_pdbs = pickle.load(f)
             ddG_df = ddG_df[ddG_df["#Pdb"].isin(split_pdbs)]
 
-        ### split the input pdb files into chains
+        ### split the input pdb files into chains.
+        # This only prepares inputs for preprocess_structures() below, which runs *only* when there is
+        # no cached structure dict. When a cache is present every structure is already in it, so
+        # requiring the raw PDBs here is a pointless dependency (and previously raised FileNotFoundError
+        # even though the cache had everything — forcing callers to ship the full PDB tree needlessly).
         complex_names = set(ddG_df["#Pdb"].to_list())
-        for pdb in complex_names:
-            *pdb_base, binder1_chains, binder2_chains = pdb.split("_")
-            pdb_base = "_".join(pdb_base)
-            pdb_path = os.path.join(pdb_dir, f"{pdb_base}.pdb")
+        cache_exists = bool(pdb_dict_cache_path) and os.path.exists(pdb_dict_cache_path)
+        if not cache_exists:
+            for pdb in complex_names:
+                *pdb_base, binder1_chains, binder2_chains = pdb.split("_")
+                pdb_base = "_".join(pdb_base)
+                pdb_path = os.path.join(pdb_dir, f"{pdb_base}.pdb")
 
-            if not os.path.exists(pdb_path):
-                raise FileNotFoundError(f"PDB file {pdb_path} does not exist.")
+                if not os.path.exists(pdb_path):
+                    raise FileNotFoundError(f"PDB file {pdb_path} does not exist.")
 
-            if not os.path.exists(
-                f"{pdb_dir}/{pdb_base}_{binder1_chains}.pdb"
-            ) or not os.path.exists(f"{pdb_dir}/{pdb_base}_{binder2_chains}.pdb"):
-                extract_chains(
-                    pdb_path,
-                    f"{pdb_dir}/{pdb_base}_{binder1_chains}.pdb",
-                    binder1_chains,
-                    f"{pdb_dir}/{pdb_base}_{binder2_chains}.pdb",
-                    binder2_chains,
-                )
+                if not os.path.exists(
+                    f"{pdb_dir}/{pdb_base}_{binder1_chains}.pdb"
+                ) or not os.path.exists(f"{pdb_dir}/{pdb_base}_{binder2_chains}.pdb"):
+                    extract_chains(
+                        pdb_path,
+                        f"{pdb_dir}/{pdb_base}_{binder1_chains}.pdb",
+                        binder1_chains,
+                        f"{pdb_dir}/{pdb_base}_{binder2_chains}.pdb",
+                        binder2_chains,
+                    )
 
         ### Get PDB file names
         self.pdb_names = []
@@ -93,7 +99,7 @@ class PPIDataset(Dataset):
 
         ### Load cached structure dictionary
         structure_dict = {}
-        if os.path.exists(pdb_dict_cache_path):
+        if cache_exists:
             print("Found cached structure dictionary at", pdb_dict_cache_path)
             with open(pdb_dict_cache_path, "rb") as f:
                 structure_dict = pickle.load(f)
