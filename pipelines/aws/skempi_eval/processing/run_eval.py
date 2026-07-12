@@ -22,6 +22,7 @@ is uploaded as the ScriptProcessor code.
 import argparse
 import glob
 import json
+import logging
 import math
 import os
 import sys
@@ -29,6 +30,10 @@ import tarfile
 
 import pandas as pd
 import torch
+
+# INFO so the periodic progress lines from stabddg.jobs.skempi_eval surface in CloudWatch (without a
+# configured handler they'd be dropped, which is why a multi-hour run looked silent).
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # baselines/ is copied to /app but is not part of the installed `stabddg` package; put /app on the
 # path so `from baselines.eval_utils import compute_metrics` resolves (namespace package).
@@ -109,6 +114,7 @@ def main():
     p.add_argument("--checkpoint-select", default="best_val",
                    help="best_val | last | initial | epoch_<N>")
     p.add_argument("--run-tag", default="run")
+    p.add_argument("--log-every", type=int, default=5, help="log progress every N complexes")
     args = p.parse_args()
 
     # Imports that need the baked image (kept after argparse so --help works anywhere).
@@ -144,11 +150,13 @@ def main():
     model.to(device)
     model.eval()
 
+    print(f"[skempi-eval] model + data ready; running eval "
+          f"(ensemble={args.ensemble}, log_every={args.log_every}) ...", flush=True)
     with torch.no_grad():
         df_pred = skempi_eval(
             model=model, dataset=dataset, device=device,
             ensemble=args.ensemble, batch_size=args.batch_size,
-            sample_size=(args.sample_size or None),
+            sample_size=(args.sample_size or None), log_every=args.log_every,
         )
 
     # ---- Output 1: per-mutation predictions (the primary asset — never aggregated away) ----

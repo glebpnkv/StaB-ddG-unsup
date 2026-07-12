@@ -1,4 +1,7 @@
+import logging
 import random
+import time
+
 import pandas as pd
 import torch
 import torch.distributed as dist
@@ -8,6 +11,8 @@ from stabddg.model import StaBddG
 from stabddg.ppi_dataset import SKEMPIDataset
 from stabddg.training import _is_dist_initialized, _is_main_process
 
+logger = logging.getLogger(__name__)
+
 
 def skempi_eval(
     model: StaBddG,
@@ -16,6 +21,7 @@ def skempi_eval(
     ensemble: int = 20,
     batch_size: int = 10000,
     sample_size: int | None = None,
+    log_every: int = 5,
 ) -> pd.DataFrame:
     """
     Distributed-aware SKEMPI/Yeast evaluation.
@@ -24,6 +30,10 @@ def skempi_eval(
     - In multi-process (torchrun) mode, each rank processes a strided
       subset of indices [rank, rank+world_size, ...].
     - Predictions from all ranks are gathered and concatenated on rank 0.
+
+    ``log_every`` emits an explicit progress line (count, elapsed, throughput, ETA) every N complexes
+    — the tqdm bar is a single carriage-return line that never surfaces in CloudWatch, so on a long
+    (esp. CPU) run these are the only signal that the job is alive and how far along it is.
     """
     if _is_dist_initialized():
         rank = dist.get_rank()
@@ -44,10 +54,16 @@ def skempi_eval(
     else:
         idx_list = list(iterator)
 
-    for idx in tqdm(
-        idx_list,
-        desc=f"Interface (rank {rank})",
-        disable=not _is_main_process(),
+    n_todo = len(idx_list)
+    logger.info(
+        "skempi_eval rank %d/%d: starting — %d/%d complexes on this rank, ensemble=%d, device=%s",
+        rank, world_size, n_todo, n_items, ensemble, device,
+    )
+    t_start = time.time()
+
+    for done, idx in enumerate(
+        tqdm(idx_list, desc=f"Interface (rank {rank})", disable=not _is_main_process()),
+        start=1,
     ):
         sample = dataset[idx]
 
@@ -97,6 +113,15 @@ def skempi_eval(
 
         df = pd.DataFrame(data)
         local_pred_dfs.append(df)
+
+        if _is_main_process() and (done % max(log_every, 1) == 0 or done == n_todo):
+            elapsed = time.time() - t_start
+            per = elapsed / done
+            eta = per * (n_todo - done)
+            logger.info(
+                "skempi_eval rank %d: %d/%d complexes | %.0fs elapsed | %.1fs/complex | ~%.0fs ETA",
+                rank, done, n_todo, elapsed, per, eta,
+            )
 
     # Concatenate local predictions on each rank (may be empty)
     if local_pred_dfs:
