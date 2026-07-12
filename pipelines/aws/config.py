@@ -65,15 +65,31 @@ def execution_role() -> str:
     """SageMaker execution role ARN. Inside SageMaker this is auto-detected; elsewhere set
     PIPELINE_ROLE_ARN (an IAM role that SageMaker can assume with S3 + ECR + SageMaker access)."""
     role = os.environ.get("PIPELINE_ROLE_ARN")
-    if role:
-        return role
-    try:
-        return sagemaker.get_execution_role(sagemaker_session())
-    except Exception as exc:  # not running inside SageMaker and no env override
+    if not role:
+        try:
+            role = sagemaker.get_execution_role(sagemaker_session())
+        except Exception as exc:  # not running inside SageMaker and no env override
+            raise RuntimeError(
+                "Could not resolve a SageMaker execution role. Set PIPELINE_ROLE_ARN to an IAM role "
+                "ARN that SageMaker can assume (with AmazonSageMakerFullAccess + S3/ECR access)."
+            ) from exc
+
+    # Guard the most common footgun: with PIPELINE_ROLE_ARN unset and an IAM Identity Center (SSO)
+    # login, get_execution_role() returns the *caller's* SSO "reserved" role. That is not a role
+    # SageMaker can assume (it doesn't trust sagemaker.amazonaws.com), so using it as the pipeline
+    # execution role fails only later, at upsert/start, with a cryptic "does not exist or does not
+    # trust 'sagemaker.amazonaws.com'". Fail here instead, with the fix.
+    if "aws-reserved/sso.amazonaws.com" in role or ":role/aws-reserved/" in role:
         raise RuntimeError(
-            "Could not resolve a SageMaker execution role. Set PIPELINE_ROLE_ARN to an IAM role ARN "
-            "that SageMaker can assume (with AmazonSageMakerFullAccess + S3/ECR access)."
-        ) from exc
+            f"Resolved execution role is an AWS SSO reserved role that SageMaker cannot assume:\n"
+            f"    {role}\n"
+            "This happens when PIPELINE_ROLE_ARN is unset and you are logged in via SSO. Point it at a "
+            "dedicated SageMaker execution role instead, e.g.:\n"
+            "    export PIPELINE_ROLE_ARN=arn:aws:iam::<acct>:role/service-role/AmazonSageMaker-ExecutionRole-...\n"
+            "Find one in the SageMaker console (Studio -> Domain -> user profile -> 'Execution role'), or:\n"
+            "    aws iam list-roles --query \"Roles[?contains(RoleName,'SageMaker-ExecutionRole')].Arn\" --output text"
+        )
+    return role
 
 
 def image_uri(tag: str | None = None) -> str:

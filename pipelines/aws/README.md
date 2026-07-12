@@ -11,12 +11,36 @@ The AWS counterpart of `pipelines/gcp/`. Same workloads, expressed with **SageMa
 
 ## One-time setup
 
-1. **Credentials** — an AWS profile/SSO session with SageMaker, S3 and ECR access.
-2. **Execution role** — an IAM role SageMaker can assume (e.g. `AmazonSageMakerFullAccess` +
-   S3/ECR). Export it:
+1. **Credentials** — an AWS profile/SSO session with SageMaker, S3 and ECR access (`aws sso login`).
+
+2. **Two env vars you almost always need to set** (both are read by `pipelines/aws/config.py`):
+
    ```bash
-   export PIPELINE_ROLE_ARN=arn:aws:iam::<acct>:role/<sagemaker-exec-role>
+   export AWS_REGION=us-east-1                      # everything (data, image, bucket) lives here
+   export PIPELINE_ROLE_ARN=arn:aws:iam::<acct>:role/service-role/AmazonSageMaker-ExecutionRole-...
    ```
+
+   - **`AWS_REGION`** — if your SSO/default region is something else (e.g. `eu-central-1`), boto3 looks
+     in the wrong region and finds nothing. Set it to `us-east-1`.
+   - **`PIPELINE_ROLE_ARN`** — the role **SageMaker itself assumes to run the job** (its trust policy
+     must allow `sagemaker.amazonaws.com`). This is **not** your login identity. If you leave it unset
+     while logged in via SSO, `config.execution_role()` falls back to your *caller* role — an SSO
+     "reserved" role SageMaker cannot assume — and the run fails at start with
+     `... does not exist or does not trust 'sagemaker.amazonaws.com'`. (config.py now catches this
+     early and prints the fix.)
+
+   **Where to get `PIPELINE_ROLE_ARN`** (in order of ease):
+   ```bash
+   # a) list existing SageMaker execution roles in the account:
+   aws iam list-roles --query "Roles[?contains(RoleName,'SageMaker-ExecutionRole')].Arn" --output text
+
+   # b) if a SageMaker Studio domain exists, read its default execution role:
+   aws sagemaker describe-domain --domain-id <id> --query "DefaultUserSettings.ExecutionRole" --output text
+   #    (find <id> with: aws sagemaker list-domains --query "Domains[].DomainId" --output text)
+   ```
+   Or in the console: **SageMaker → Domains → your domain → user profile → "Execution role"**. If none
+   exists, create a role that trusts `sagemaker.amazonaws.com` with `AmazonSageMakerFullAccess` + S3/ECR.
+
 3. **Container image** — build the project image and push it to ECR:
    ```bash
    ./scripts/build_and_push/sagemaker.sh          # builds containers/Dockerfile.sagemaker
@@ -64,7 +88,7 @@ export PIPELINE_IMAGE_TAG=gpu
 python -m pipelines.aws.intact_pretrain.pipeline run --data-uri s3://<bucket>/<prefix>/intact
 ```
 
-A single GPU `TrainingStep` on **`ml.g5.12xlarge`** (4× A10G) using SageMaker's managed
+A single GPU `TrainingStep` on **`ml.g6.12xlarge`** (4× L4) using SageMaker's managed
 `torch_distributed` (torchrun across the 4 GPUs — `jobs/intact_pretrain.py` initialises the process
 group and wraps the model in DDP), with TensorBoard synced to S3, model artifacts to
 `/opt/ml/model`, then a **`RegisterModel`** step that records the result in the SageMaker **Model
