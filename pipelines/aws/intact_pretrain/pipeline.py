@@ -48,7 +48,7 @@ def build_pipeline() -> Pipeline:
     bucket = ParameterString("ArtifactBucket", default_value=config.default_bucket())
     prefix = ParameterString("S3Prefix", default_value=config.DEFAULT_S3_PREFIX)
     data_uri = ParameterString("IntactDataS3Uri")  # s3 prefix with the intact/ layout
-    instance_type = ParameterString("TrainingInstanceType", default_value="ml.g5.12xlarge")  # 4x A10G
+    instance_type = ParameterString("TrainingInstanceType", default_value="ml.g6.12xlarge")  # 4x L4
     run_name = ParameterString("RunName", default_value="intact-pretrain")
     # Short human label baked into the experiment trial name so runs are self-identifying in Studio
     # Experiments (e.g. RunTag=b-baseline vs RunTag=a-balanced-sampler for the A/B comparison).
