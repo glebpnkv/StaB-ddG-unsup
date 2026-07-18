@@ -95,20 +95,30 @@ class IntactDataset(Dataset):
     feature_type_pos = [
         "mutation causing(MI:2227)",
         "mutation increasing(MI:0382)",
-        "mutation increasing rate(MI:1131)",
-        "mutation increasing strength(MI:1132)"
+        "mutation increasing strength(MI:1132)",
     ]
     feature_type_neg = [
         "mutation decreasing(MI:0119)",
-        "mutation decreasing rate(MI:1130)",
         "mutation decreasing strength(MI:1133)",
         "mutation disrupting(MI:0573)",
-        "mutation disrupting rate(MI:1129)",
         "mutation disrupting strength(MI:1128)",
     ]
-    feature_type_neutral = [
-        "mutation with no effect(MI:2226)"
+    # Kinetic on/off-rate changes (kon/koff). A change in a rate constant does NOT fix the sign
+    # of the *equilibrium* binding free energy: Kd = koff / kon can be unchanged when kon and koff
+    # move together. These therefore carry no reliable ΔΔG_bind direction and must not be used as
+    # directional (+1 / -1) anchors — they were previously mislabeled as such (increasing rate → +1,
+    # decreasing/disrupting rate → -1). We fold them into the neutral (sign 0) set. NB "rate changed"
+    # means "affinity change unknown", which is weaker than a measured "no effect"; they are kept as
+    # a named subset so a future zero-anchor neutral term can exclude them if desired.
+    feature_type_rate = [
+        "mutation increasing rate(MI:1131)",
+        "mutation decreasing rate(MI:1130)",
+        "mutation disrupting rate(MI:1129)",
     ]
+    feature_type_no_effect = [
+        "mutation with no effect(MI:2226)",
+    ]
+    feature_type_neutral = feature_type_no_effect + feature_type_rate
 
     sequence_unknown = AA3_TO_1["UNK"]
 
